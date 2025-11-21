@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from sys import exit
 from typing import Optional
+
 import requests
 from defusedxml import ElementTree as ET
 from adbutils import AdbClient, AdbDevice
@@ -32,6 +33,7 @@ PATCHED_DIR.mkdir(exist_ok=True)
 
 DEFAULT_SAVE_DIR = ROOT_DIR / "saved_apks"
 DEFAULT_SAVE_DIR.mkdir(exist_ok=True)
+
 
 def debug_log(message: str) -> None:
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}")
@@ -86,6 +88,10 @@ def patch_manifest(unpacked_apk_path: Path) -> None:
     root = tree.getroot()
 
     application = root.find(".//application")
+    if application is None:
+        debug_log("No <application> tag found in manifest – nothing patched")
+        return
+
     ns = {"android": "http://schemas.android.com/apk/res/android"}
     attr = f"{{{ns['android']}}}networkSecurityConfig"
     if application.get(attr) is None:
@@ -101,17 +107,17 @@ def add_network_security_config(unpacked_apk_path: Path) -> None:
     config_path = unpacked_apk_path / "res" / "xml"
     config_path.mkdir(parents=True, exist_ok=True)
     (config_path / "network_security_config.xml").write_text(
-        """<?xml version=\"1.0\" encoding=\"utf-8\"?>
+        """<?xml version="1.0" encoding="utf-8"?>
 <network-security-config>
     <debug-overrides>
         <trust-anchors>
-            <certificates src=\"user\" />
+            <certificates src="user" />
         </trust-anchors>
     </debug-overrides>
-    <base-config cleartextTrafficPermitted=\"true\">
+    <base-config cleartextTrafficPermitted="true">
         <trust-anchors>
-            <certificates src=\"system\" />
-            <certificates src=\"user\" />
+            <certificates src="system" />
+            <certificates src="user" />
         </trust-anchors>
     </base-config>
 </network-security-config>
@@ -130,6 +136,19 @@ def save_patched_apks(src_dir: Path, dest_root: Path) -> None:
     shutil.copytree(src_dir, dest)
     debug_log(f"Patched APK(s) copied to {dest}")
 
+
+def run_signer(apk_path: Path, signer_jar: Path) -> None:
+    """Run uber-apk-signer with --allowResign on a single APK."""
+    cmd = [
+        "java",
+        "-jar",
+        str(signer_jar),
+        "-a",
+        str(apk_path),
+        "--allowResign",
+    ]
+    debug_log(f"Signing with: {' '.join(cmd)}")
+    sp.run(cmd, check=True)
 
 
 def patch_package(
@@ -150,33 +169,68 @@ def patch_package(
     patched_output.mkdir()
 
     for apk in original_output.iterdir():
-        file_name = apk.stem  
-        unpacked_apk_path = patched_output / file_name
-        packed_apk_path = patched_output / f"{file_name}.repack.apk"
-        signed_apk_path = patched_output / f"{file_name}.repack-aligned-debugSigned.apk"
-
-        debug_log(f"Unpacking {file_name} …")
-        sp.run(
-            ["java", "-jar", str(apktool_jar), "d", str(apk), "-o", str(unpacked_apk_path), "-s"],
-            check=True,
-        )
+        file_name = apk.stem
 
         if file_name == "base":
+            unpacked_apk_path = patched_output / file_name
+            packed_apk_path = patched_output / f"{file_name}.repack.apk"
+            signed_apk_path = (
+                patched_output / f"{file_name}.repack-aligned-debugSigned.apk"
+            )
+
+            debug_log(f"Unpacking {file_name} …")
+            sp.run(
+                [
+                    "java",
+                    "-jar",
+                    str(apktool_jar),
+                    "d",
+                    str(apk),
+                    "-o",
+                    str(unpacked_apk_path),
+                    "-s",
+                ],
+                check=True,
+            )
+
             patch_manifest(unpacked_apk_path)
             add_network_security_config(unpacked_apk_path)
 
-        debug_log(f"Repacking {file_name} …")
-        sp.run(
-            ["java", "-jar", str(apktool_jar), "b", str(unpacked_apk_path), "-o", str(packed_apk_path)],
-            check=True,
-        )
+            debug_log(f"Repacking {file_name} …")
+            sp.run(
+                [
+                    "java",
+                    "-jar",
+                    str(apktool_jar),
+                    "b",
+                    str(unpacked_apk_path),
+                    "-o",
+                    str(packed_apk_path),
+                ],
+                check=True,
+            )
 
-        debug_log(f"Signing {file_name} …")
-        sp.run(["java", "-jar", str(signer_jar), "-a", str(packed_apk_path)], check=True)
+            debug_log(f"Signing {file_name} …")
+            run_signer(packed_apk_path, signer_jar)
 
-        os.remove(packed_apk_path)
-        shutil.rmtree(unpacked_apk_path)
-        signed_apk_path.rename(patched_output / f"{file_name}_patched.apk")
+            os.remove(packed_apk_path)
+            shutil.rmtree(unpacked_apk_path)
+            signed_apk_path.rename(patched_output / f"{file_name}_patched.apk")
+
+        else:
+            debug_log(f"Copying and signing split {file_name} …")
+
+            tmp_apk = patched_output / f"{file_name}.orig.apk"
+            shutil.copy2(apk, tmp_apk)
+
+            run_signer(tmp_apk, signer_jar)
+
+            signed_split = (
+                patched_output / f"{file_name}.orig-aligned-debugSigned.apk"
+            )
+            signed_split.rename(patched_output / f"{file_name}_patched.apk")
+
+            tmp_apk.unlink()
 
     if save_dir is not None:
         save_dir = save_dir.expanduser().resolve()
@@ -193,8 +247,10 @@ def patch_package(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Patch an installed APK so it trusts user certificates, then reinstall it, "
-                    "optionally saving a copy of the patched artifact(s).",
+        description=(
+            "Patch an installed APK so it trusts user certificates, then reinstall it, "
+            "optionally saving a copy of the patched artifact(s)."
+        ),
     )
     parser.add_argument("serial", help="ADB device serial (from 'adb devices')")
     parser.add_argument("package_name", help="Package name to patch (e.g. com.example.app)")
@@ -202,8 +258,10 @@ def main() -> None:
         "-o",
         "--output",
         metavar="DIR",
-        help="Destination directory to copy patched APK(s). If omitted, patched APKs "
-             "are not copied – the behaviour matches the original script.",
+        help=(
+            "Destination directory to copy patched APK(s). If omitted, patched APKs "
+            "are only kept in the 'patched' folder."
+        ),
         default=None,
     )
 
@@ -228,3 +286,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

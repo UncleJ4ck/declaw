@@ -1,0 +1,8 @@
+# Python virtualenv
+env/
+
+# Build / generated dirs
+packages/
+patched/
+saved_apks/
+
