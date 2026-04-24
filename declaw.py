@@ -74,6 +74,7 @@ ADB_PORT = int(os.environ.get("ADB_PORT", "5037"))
 APKTOOL_URL = "https://api.github.com/repos/iBotPeaches/Apktool/releases/latest"
 UBER_APK_SIGNER_URL = "https://api.github.com/repos/patrickfav/uber-apk-signer/releases/latest"
 FRIDA_RELEASES_URL = "https://api.github.com/repos/frida/frida/releases/latest"
+BUNDLETOOL_URL = "https://api.github.com/repos/google/bundletool/releases/latest"
 
 DEFAULT_BYPASS_URLS = [
     "https://raw.githubusercontent.com/httptoolkit/frida-interception-and-unpinning/main/android/android-certificate-unpinning.js",
@@ -113,6 +114,9 @@ GADGET_LIBNAME = os.environ.get("DECLAW_GADGET_LIBNAME", "app-support")
 
 # Bundle container formats we can unpack into a split-APK directory.
 BUNDLE_EXTENSIONS = {".xapk", ".apks", ".apkm", ".apkmos"}
+# Google App Bundles are handled separately: bundletool converts them to a
+# universal .apks first, then we extract it like any other bundle.
+AAB_EXTENSION = ".aab"
 
 # reFlutter uses one release per known Flutter engine snapshot hash,
 # tagged "android-v2-<hash>" with libflutter_<arch>.so assets.
@@ -257,6 +261,44 @@ def _cached_jar(api_url: str, *, refresh: bool) -> Path:
         return dest
     _stream_download(asset["browser_download_url"], dest)
     return dest
+
+
+def fetch_bundletool(*, refresh: bool) -> Path:
+    """Return a cached bundletool jar (for .aab -> .apks conversion)."""
+    info = _gh_latest(BUNDLETOOL_URL)
+    asset = next((a for a in info.get("assets", []) if a["name"].endswith(".jar")), None)
+    if asset is None:
+        raise RuntimeError("No bundletool jar found in latest release")
+    dest = UTILS_DIR / asset["name"]
+    if dest.exists() and not refresh:
+        log.debug("Using cached %s", dest.name)
+        return dest
+    _stream_download(asset["browser_download_url"], dest)
+    return dest
+
+
+def convert_aab(aab: Path, *, refresh: bool) -> Path:
+    """Convert a Google .aab into a universal .apks set via bundletool.
+
+    Returns the path to the generated .apks (a zip with a single
+    universal.apk inside), ready to be fed through extract_bundle().
+    bundletool signs with an auto-generated debug key; uber-apk-signer
+    re-signs everything later so the key doesn't matter.
+    """
+    bundletool_jar = fetch_bundletool(refresh=refresh)
+    out_dir = PACKAGES_DIR / f"{aab.stem}_aab"
+    shutil.rmtree(out_dir, ignore_errors=True)
+    out_dir.mkdir(parents=True)
+    apks_out = out_dir / f"{aab.stem}.apks"
+    log.info("Converting %s to universal APKs via bundletool", aab.name)
+    _run([
+        "java", "-jar", bundletool_jar,
+        "build-apks",
+        f"--bundle={aab}",
+        f"--output={apks_out}",
+        "--mode=universal",
+    ])
+    return apks_out
 
 
 def fetch_frida_gadget(abi: str, *, refresh: bool) -> Path:
@@ -1149,9 +1191,15 @@ def run_pipeline(
                          minimal=minimal, refresh=refresh)
 
 
-def _collect_apks(path: Path) -> list[Path]:
+def _collect_apks(path: Path, *, refresh: bool = False) -> list[Path]:
     if path.is_file():
-        if path.suffix.lower() in BUNDLE_EXTENSIONS:
+        suffix = path.suffix.lower()
+        if suffix == AAB_EXTENSION:
+            # .aab: convert to universal .apks with bundletool, then extract.
+            apks = convert_aab(path, refresh=refresh)
+            bundle_dir = extract_bundle(apks)
+            return sorted(bundle_dir.glob("*.apk"))
+        if suffix in BUNDLE_EXTENSIONS:
             bundle_dir = extract_bundle(path)
             return sorted(bundle_dir.glob("*.apk"))
         return [path]
@@ -1168,7 +1216,7 @@ def _run_local_mode(
     minimal: bool,
     refresh: bool,
 ) -> int:
-    apks = _collect_apks(target_path)
+    apks = _collect_apks(target_path, refresh=refresh)
     if not apks:
         log.error("No .apk files in %s", target_path)
         return 3

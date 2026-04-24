@@ -51,6 +51,9 @@ declaw com.example.app                    # one device attached
 declaw -s emulator-5554 com.example.app   # multiple devices
 declaw ./app.apk                          # local APK, no install
 declaw ./split_apks/ -o ~/pentest/out     # directory of splits, save a copy
+declaw ./app.xapk                         # APKPure bundle, auto-extracted
+declaw ./app.apks                         # SAI / bundletool split-APK set
+declaw ./app.aab                          # Google App Bundle (uses bundletool)
 declaw --minimal com.example.app          # NSC only, skip the gadget
 declaw -c ~/.mitmproxy/ca.pem com.bank    # bake in your proxy's CA
 declaw --refresh com.example.app          # re-download every cached tool
