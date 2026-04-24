@@ -1,8 +1,17 @@
-# Python virtualenv
+# Python
 env/
+.venv/
+__pycache__/
+*.pyc
 
-# Build / generated dirs
+# declaw caches / working dirs
+utils/*.jar
+utils/*.so
+utils/*.so.xz
+utils/*.js
 packages/
 patched/
 saved_apks/
 
+# samples pulled during local testing
+samples/

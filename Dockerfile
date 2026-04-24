@@ -1,28 +1,29 @@
-# Use an official Python runtime as a parent image
-FROM python:3.10-slim
+FROM python:3.12-slim
 
-# Set the working directory to /app
-WORKDIR /app
+# uv handles the Python deps via the PEP-723 header in declaw.py
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 
-# Copy the current directory contents into the container at /app
-COPY . /app
-
-# Install any needed packages specified in requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Install OpenJDK for running Java applications (Apktool, uber-apk-signer)
-# and ADB for interacting with Android devices
 RUN apt-get update && \
-    apt-get install -y default-jdk android-tools-adb adb usbutils && \
+    apt-get install -y --no-install-recommends \
+        default-jre-headless \
+        adb \
+        usbutils \
+        xz-utils \
+        ca-certificates && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# Create directories for storing packages and patched APKs
-RUN mkdir -p /app/packages /app/patched /app/utils
+WORKDIR /app
+COPY declaw.py /app/
 
-# Make port 5037 available to the world outside this container
-# This port is used by ADB server
+# utils/ is declared as a volume so the cached apktool, signer, gadget, and
+# bypass bundle survive across runs.
+RUN mkdir -p /app/utils /app/packages /app/patched
+VOLUME ["/app/utils"]
+
+ENV UV_SYSTEM_PYTHON=1 \
+    UV_NO_CACHE_DIR=1
+
 EXPOSE 5037
 
-# Set the Docker container's entrypoint to the script
-ENTRYPOINT ["python3", "adb-ssl-unpinning.py"]
+ENTRYPOINT ["uv", "run", "--no-project", "declaw.py"]
