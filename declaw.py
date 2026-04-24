@@ -106,6 +106,38 @@ FRIDA_ABI_MAP = {
     "x86_64": "android-x86_64",
 }
 
+# Non-obvious gadget library name (stealth). Evades the common
+# /proc/self/maps grep-for-"frida-gadget" anti-Frida check. Everything
+# (smali loader, gadget .so, config, script) uses this name.
+GADGET_LIBNAME = os.environ.get("DECLAW_GADGET_LIBNAME", "app-support")
+
+# Bundle container formats we can unpack into a split-APK directory.
+BUNDLE_EXTENSIONS = {".xapk", ".apks", ".apkm", ".apkmos"}
+
+# reFlutter uses one release per known Flutter engine snapshot hash,
+# tagged "android-v2-<hash>" with libflutter_<arch>.so assets.
+REFLUTTER_CSV_URL = "https://raw.githubusercontent.com/Impact-I/reFlutter/main/enginehash.csv"
+REFLUTTER_RELEASE_URL = "https://github.com/Impact-I/reFlutter/releases/download/android-v2-{hash}/libflutter_{arch}.so"
+REFLUTTER_ABI_MAP = {
+    "arm64-v8a": "arm64",
+    "armeabi-v7a": "arm",
+    "armeabi": "arm",
+}
+# Skip reFlutter's static patch on engines < 3.24.0: those had a hardcoded
+# Burp proxy IP baked in, which would redirect traffic whether we wanted it
+# or not. On 3.24.0+ the engine is cert-bypass only.
+REFLUTTER_MIN_VERSION = (3, 24, 0)
+
+# Well-known SSL-pinning classes in the Java layer. For each one we look
+# for a file at smali*/<class>.smali and stub the named method with
+# `return-void`. This is the apk-mitm style backup that keeps working
+# even when Frida is blocked at runtime.
+SMALI_PIN_TARGETS = [
+    ("okhttp3/CertificatePinner", "check"),
+    ("com/datatheorem/android/trustkit/pinning/PinningTrustManager", "checkServerTrusted"),
+    ("com/appmattus/certificatetransparency/internal/verifier/CertificateTransparencyTrustManager", "checkServerTrusted"),
+]
+
 NETWORK_SECURITY_CONFIG_XML = """\
 <?xml version="1.0" encoding="utf-8"?>
 <network-security-config>
@@ -161,13 +193,15 @@ emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
 -----END CERTIFICATE-----
 """
 
-GADGET_CONFIG_JSON = {
-    "interaction": {
-        "type": "script",
-        "path": "./libfrida-gadget.script.so",
-        "on_change": "reload",
-    },
-}
+def _gadget_config_bytes() -> bytes:
+    payload = {
+        "interaction": {
+            "type": "script",
+            "path": f"./lib{GADGET_LIBNAME}.script.so",
+            "on_change": "reload",
+        },
+    }
+    return json.dumps(payload, indent=2).encode("utf-8")
 
 
 # --------------------------------------------------------------------------- #
@@ -512,23 +546,30 @@ _CLINIT_RE = re.compile(
     r"(\.method\s+static\s+constructor\s+<clinit>\(\)V\b.*?)(\.end method)",
     re.DOTALL,
 )
-_LOAD_LIBRARY_SMALI = (
-    "    const-string v0, \"frida-gadget\"\n"
-    "    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V\n"
-)
-_NEW_CLINIT = (
-    "\n.method static constructor <clinit>()V\n"
-    "    .locals 1\n"
-    f"{_LOAD_LIBRARY_SMALI}"
-    "    return-void\n"
-    ".end method\n"
-)
+
+
+def _load_library_smali() -> str:
+    return (
+        f"    const-string v0, \"{GADGET_LIBNAME}\"\n"
+        "    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V\n"
+    )
+
+
+def _new_clinit_smali() -> str:
+    return (
+        "\n.method static constructor <clinit>()V\n"
+        "    .locals 1\n"
+        f"{_load_library_smali()}"
+        "    return-void\n"
+        ".end method\n"
+    )
 
 
 def _inject_load_library(smali_path: Path) -> bool:
     text = smali_path.read_text(encoding="utf-8")
-    if "\"frida-gadget\"" in text:
+    if f'"{GADGET_LIBNAME}"' in text:
         return False
+    load_snippet = _load_library_smali()
     m = _CLINIT_RE.search(text)
     if m:
         head, tail = m.group(1), m.group(2)
@@ -547,14 +588,15 @@ def _inject_load_library(smali_path: Path) -> bool:
         # Inject *before* the final `return-void` so the new code actually runs.
         last_ret = head2.rfind("return-void")
         if last_ret == -1:
-            new_head = head2 + _LOAD_LIBRARY_SMALI
+            new_head = head2 + load_snippet
         else:
             line_start = head2.rfind("\n", 0, last_ret) + 1
-            new_head = head2[:line_start] + _LOAD_LIBRARY_SMALI + head2[line_start:]
+            new_head = head2[:line_start] + load_snippet + head2[line_start:]
         new_text = text.replace(m.group(0), new_head + tail, 1)
     else:
+        new_clinit = _new_clinit_smali()
         anchor = text.find("\n.method")
-        new_text = (text[:anchor] + _NEW_CLINIT + text[anchor:]) if anchor >= 0 else text + _NEW_CLINIT
+        new_text = (text[:anchor] + new_clinit + text[anchor:]) if anchor >= 0 else text + new_clinit
     smali_path.write_text(new_text, encoding="utf-8")
     return True
 
@@ -572,7 +614,10 @@ def inject_frida_gadget(
     lib_root = unpacked / "lib"
     lib_root.mkdir(exist_ok=True)
 
-    config_bytes = json.dumps(GADGET_CONFIG_JSON, indent=2).encode("utf-8")
+    config_bytes = _gadget_config_bytes()
+    gadget_file = f"lib{GADGET_LIBNAME}.so"
+    config_file = f"lib{GADGET_LIBNAME}.config.so"
+    script_file = f"lib{GADGET_LIBNAME}.script.so"
 
     for abi in target_abis:
         if abi not in FRIDA_ABI_MAP:
@@ -581,26 +626,324 @@ def inject_frida_gadget(
         gadget_so = fetch_frida_gadget(abi, refresh=refresh)
         abi_dir = lib_root / abi
         abi_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(gadget_so, abi_dir / "libfrida-gadget.so")
-        (abi_dir / "libfrida-gadget.config.so").write_bytes(config_bytes)
-        shutil.copy2(bypass_script, abi_dir / "libfrida-gadget.script.so")
-        log.info("Gadget + unpin script placed in lib/%s/", abi)
+        shutil.copy2(gadget_so, abi_dir / gadget_file)
+        (abi_dir / config_file).write_bytes(config_bytes)
+        shutil.copy2(bypass_script, abi_dir / script_file)
+        log.info("Gadget + unpin script placed in lib/%s/ as %s", abi, gadget_file)
 
     target_class = manifest.application_class or manifest.launcher_activity
-    if not target_class:
-        log.warning("No Application or launcher class found. "
-                    "The gadget is in the APK but nothing loads it. "
-                    "Add System.loadLibrary(\"frida-gadget\") yourself.")
+    loaded = False
+    if target_class:
+        smali_path = _find_smali_for_class(unpacked, target_class)
+        if smali_path is not None:
+            if _inject_load_library(smali_path):
+                log.info("Injected loadLibrary(\"%s\") into %s", GADGET_LIBNAME, target_class)
+            else:
+                log.info("Gadget loader already present in %s", target_class)
+            loaded = True
+    if not loaded:
+        # Fallback: synthesize our own Application class that subclasses the
+        # original (or android.app.Application) and loads the gadget in its clinit.
+        inject_application_wrapper(unpacked, manifest.application_class)
+        loaded = True
+
+    # Defence in depth: also drop a ContentProvider that loads the gadget.
+    # ContentProviders are instantiated before Application.onCreate(), so
+    # the gadget attaches even if something skips the Application path.
+    inject_content_provider(unpacked)
+
+
+# --------------------------------------------------------------------------- #
+#  Bundle input (.xapk, .apks, .apkm)                                         #
+# --------------------------------------------------------------------------- #
+
+def extract_bundle(bundle_path: Path) -> Path:
+    """Unpack a .xapk / .apks / .apkm into a flat dir of .apk files."""
+    out_dir = PACKAGES_DIR / f"{bundle_path.stem}_bundle"
+    shutil.rmtree(out_dir, ignore_errors=True)
+    out_dir.mkdir(parents=True)
+    log.info("Extracting bundle %s", bundle_path.name)
+    with zipfile.ZipFile(bundle_path) as zf:
+        for name in zf.namelist():
+            if name.lower().endswith(".apk"):
+                zf.extract(name, out_dir)
+    # Flatten: move any nested .apk to the top level.
+    for apk in list(out_dir.rglob("*.apk")):
+        if apk.parent != out_dir:
+            target = out_dir / apk.name
+            if target.exists():
+                target.unlink()
+            shutil.move(str(apk), str(target))
+    # Drop empty subdirs.
+    for sub in sorted(out_dir.iterdir(), reverse=True):
+        if sub.is_dir():
+            try:
+                sub.rmdir()
+            except OSError:
+                pass
+    found = sorted(out_dir.glob("*.apk"))
+    log.info("Extracted %d APK(s) from bundle", len(found))
+    return out_dir
+
+
+# --------------------------------------------------------------------------- #
+#  Smali-level pinning patches (apk-mitm style backup layer)                  #
+# --------------------------------------------------------------------------- #
+
+def apply_smali_pin_patches(unpacked: Path) -> int:
+    """Stub well-known pinning classes' methods to `return-void`.
+
+    Runs in addition to the runtime Frida hooks. If the target app kills
+    Frida, the static patch still disables the most common Java-layer
+    pinning. Count of patched methods is returned for logging.
+    """
+    patched = 0
+    for class_path, method_name in SMALI_PIN_TARGETS:
+        rel = class_path + ".smali"
+        for smali_root in sorted(unpacked.glob("smali*")):
+            target = smali_root / rel
+            if not target.is_file():
+                continue
+            if _patch_void_method_to_noop(target, method_name):
+                log.info("Smali-patched %s.%s", class_path, method_name)
+                patched += 1
+    if patched == 0:
+        log.debug("No smali pin-patch targets found in this APK.")
+    return patched
+
+
+def _patch_void_method_to_noop(smali_path: Path, method_name: str) -> bool:
+    """Replace the body of every `<method_name>(...)V` in the file with `return-void`."""
+    text = smali_path.read_text(encoding="utf-8")
+    pattern = re.compile(
+        rf"(\.method\s+(?:\w+\s+)*{re.escape(method_name)}\([^)]*\)V[^\n]*\n)"
+        r"(.*?)"
+        r"(\.end method)",
+        re.DOTALL,
+    )
+    new_text, n = pattern.subn(r"\1    .locals 0\n    return-void\n\3", text)
+    if n > 0:
+        smali_path.write_text(new_text, encoding="utf-8")
+        return True
+    return False
+
+
+# --------------------------------------------------------------------------- #
+#  Application-class wrapper (fallback when we cannot patch the original)     #
+# --------------------------------------------------------------------------- #
+
+_WRAPPER_CLASS = "com/declaw/DeclawApp"
+_PROVIDER_CLASS = "com/declaw/DeclawPreload"
+
+
+def inject_application_wrapper(unpacked: Path, orig_app_class: Optional[str]) -> None:
+    """Create a subclass Application that loads the gadget in <clinit> and
+    rewrite android:name to point at it. Used when there's no existing
+    Application class to patch, or when its clinit couldn't be touched.
+    """
+    super_class = orig_app_class.replace(".", "/") if orig_app_class else "android/app/Application"
+    rel = _WRAPPER_CLASS + ".smali"
+
+    smali = (
+        f".class public L{_WRAPPER_CLASS};\n"
+        f".super L{super_class};\n"
+        ".source \"DeclawApp.java\"\n\n"
+        ".method public constructor <init>()V\n"
+        "    .registers 1\n"
+        f"    invoke-direct {{p0}}, L{super_class};-><init>()V\n"
+        "    return-void\n"
+        ".end method\n\n"
+        ".method static constructor <clinit>()V\n"
+        "    .locals 1\n"
+        f"{_load_library_smali()}"
+        "    return-void\n"
+        ".end method\n"
+    )
+
+    smali_root = unpacked / "smali"
+    smali_root.mkdir(exist_ok=True)
+    out = smali_root / rel
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(smali, encoding="utf-8")
+
+    manifest_path = unpacked / "AndroidManifest.xml"
+    tree = ET.parse(manifest_path)
+    root = tree.getroot()
+    application = root.find(".//application")
+    if application is not None:
+        application.set(QN_NAME, _WRAPPER_CLASS.replace("/", "."))
+        tree.write(manifest_path, encoding="utf-8", xml_declaration=True)
+        log.info("Injected Application wrapper %s (super=%s)",
+                 _WRAPPER_CLASS.replace("/", "."), super_class.replace("/", "."))
+
+
+def inject_content_provider(unpacked: Path) -> None:
+    """Register a stub ContentProvider that loads the gadget in <clinit>.
+
+    ContentProviders are constructed before Application.onCreate(), so this
+    pulls the gadget load earlier than Application-only injection and gives
+    us a second shot if something bypasses the Application path.
+    """
+    manifest_path = unpacked / "AndroidManifest.xml"
+    tree = ET.parse(manifest_path)
+    root = tree.getroot()
+    application = root.find(".//application")
+    if application is None:
         return
-    smali_path = _find_smali_for_class(unpacked, target_class)
-    if smali_path is None:
-        log.warning("Smali file for %s not found; gadget loader NOT injected.",
-                    target_class)
-        return
-    if _inject_load_library(smali_path):
-        log.info("Injected loadLibrary(\"frida-gadget\") into %s", target_class)
-    else:
-        log.info("Gadget loader already present in %s", target_class)
+    pkg = root.get("package", "declaw.preload")
+
+    # Don't inject twice.
+    for prov in application.findall("provider"):
+        if prov.get(QN_NAME) == _PROVIDER_CLASS.replace("/", "."):
+            return
+
+    # defusedxml doesn't export SubElement (it's a creation helper, not a
+    # parsing primitive); use stdlib for this.
+    provider = _stdlib_ET.SubElement(application, "provider")
+    provider.set(QN_NAME, _PROVIDER_CLASS.replace("/", "."))
+    provider.set(f"{{{ANDROID_NS}}}authorities", f"{pkg}.declaw.preload")
+    provider.set(f"{{{ANDROID_NS}}}exported", "false")
+    tree.write(manifest_path, encoding="utf-8", xml_declaration=True)
+
+    smali = (
+        f".class public L{_PROVIDER_CLASS};\n"
+        ".super Landroid/content/ContentProvider;\n"
+        ".source \"DeclawPreload.java\"\n\n"
+        ".method public constructor <init>()V\n"
+        "    .registers 1\n"
+        "    invoke-direct {p0}, Landroid/content/ContentProvider;-><init>()V\n"
+        "    return-void\n"
+        ".end method\n\n"
+        ".method static constructor <clinit>()V\n"
+        "    .locals 1\n"
+        f"{_load_library_smali()}"
+        "    return-void\n"
+        ".end method\n\n"
+        ".method public onCreate()Z\n"
+        "    .registers 2\n"
+        "    const/4 v0, 0x1\n"
+        "    return v0\n"
+        ".end method\n\n"
+        ".method public query(Landroid/net/Uri;[Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;Ljava/lang/String;)Landroid/database/Cursor;\n"
+        "    .registers 6\n"
+        "    const/4 v0, 0x0\n"
+        "    return-object v0\n"
+        ".end method\n\n"
+        ".method public getType(Landroid/net/Uri;)Ljava/lang/String;\n"
+        "    .registers 2\n"
+        "    const/4 v0, 0x0\n"
+        "    return-object v0\n"
+        ".end method\n\n"
+        ".method public insert(Landroid/net/Uri;Landroid/content/ContentValues;)Landroid/net/Uri;\n"
+        "    .registers 3\n"
+        "    const/4 v0, 0x0\n"
+        "    return-object v0\n"
+        ".end method\n\n"
+        ".method public delete(Landroid/net/Uri;Ljava/lang/String;[Ljava/lang/String;)I\n"
+        "    .registers 4\n"
+        "    const/4 v0, 0x0\n"
+        "    return v0\n"
+        ".end method\n\n"
+        ".method public update(Landroid/net/Uri;Landroid/content/ContentValues;Ljava/lang/String;[Ljava/lang/String;)I\n"
+        "    .registers 5\n"
+        "    const/4 v0, 0x0\n"
+        "    return v0\n"
+        ".end method\n"
+    )
+
+    smali_root = unpacked / "smali"
+    smali_root.mkdir(exist_ok=True)
+    out = smali_root / (_PROVIDER_CLASS + ".smali")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(smali, encoding="utf-8")
+    log.info("Injected ContentProvider %s for early gadget load",
+             _PROVIDER_CLASS.replace("/", "."))
+
+
+# --------------------------------------------------------------------------- #
+#  Flutter static patch via reFlutter                                         #
+# --------------------------------------------------------------------------- #
+
+def _fetch_reflutter_engine_map(refresh: bool) -> dict[str, str]:
+    """Return {snapshot_hash_hex: flutter_version}."""
+    cache = UTILS_DIR / "reflutter-enginehash.csv"
+    if not cache.exists() or refresh:
+        _stream_download(REFLUTTER_CSV_URL, cache)
+    mapping: dict[str, str] = {}
+    for line in cache.read_text(encoding="utf-8").splitlines()[1:]:
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) >= 3:
+            version, _commit, snap = parts[:3]
+            if version and snap:
+                mapping[snap.lower()] = version
+    return mapping
+
+
+def _flutter_version_tuple(v: str) -> tuple[int, ...]:
+    try:
+        return tuple(int(x) for x in v.split(".")[:3])
+    except ValueError:
+        return (0, 0, 0)
+
+
+def _find_flutter_snapshot_hash(libflutter: Path, known: dict[str, str]) -> Optional[str]:
+    """Scan the libflutter.so bytes for any known snapshot hash."""
+    data = libflutter.read_bytes()
+    for h in known:
+        if h.encode() in data:
+            return h
+    return None
+
+
+def try_patch_flutter_static(
+    unpacked: Path,
+    inspection: ApkInspection,
+    *,
+    refresh: bool,
+) -> bool:
+    """Swap in reFlutter's pre-patched libflutter.so when the engine
+    snapshot hash is known. Returns True if any ABI was patched."""
+    if "flutter" not in inspection.frameworks:
+        return False
+    if os.environ.get("DECLAW_FLUTTER_STATIC", "1") == "0":
+        log.info("Flutter static patch disabled by DECLAW_FLUTTER_STATIC=0.")
+        return False
+    try:
+        known = _fetch_reflutter_engine_map(refresh=refresh)
+    except requests.RequestException as exc:
+        log.warning("reFlutter hash table fetch failed (%s). Falling back to Frida hooks.", exc)
+        return False
+
+    patched_any = False
+    for abi in sorted(inspection.abis):
+        if abi not in REFLUTTER_ABI_MAP:
+            continue  # reFlutter publishes arm / arm64 only
+        libflutter = unpacked / "lib" / abi / "libflutter.so"
+        if not libflutter.exists():
+            continue
+        snap = _find_flutter_snapshot_hash(libflutter, known)
+        if not snap:
+            log.info("Flutter: unknown engine hash in lib/%s/, relying on Frida script.", abi)
+            continue
+        version = known[snap]
+        if _flutter_version_tuple(version) < REFLUTTER_MIN_VERSION:
+            log.info("Flutter %s (lib/%s/) has hardcoded proxy in reFlutter's patch, skipping.",
+                     version, abi)
+            continue
+        arch = REFLUTTER_ABI_MAP[abi]
+        cache = UTILS_DIR / f"reflutter-libflutter-{snap}-{arch}.so"
+        if not cache.exists() or refresh:
+            try:
+                _stream_download(REFLUTTER_RELEASE_URL.format(hash=snap, arch=arch), cache)
+            except requests.RequestException as exc:
+                log.warning("reFlutter asset download failed for %s / %s (%s). Falling back.",
+                            version, arch, exc)
+                continue
+        shutil.copy2(cache, libflutter)
+        log.info("Flutter: replaced lib/%s/libflutter.so with reFlutter engine %s",
+                 abi, version)
+        patched_any = True
+    return patched_any
 
 
 # --------------------------------------------------------------------------- #
@@ -718,7 +1061,16 @@ def patch_base_apk(
     manifest_info = patch_manifest(unpacked)
     add_network_security_config(unpacked)
 
+    # Always apply the cheap Java-layer smali patches; they give us a static
+    # fallback for when Frida is blocked, and they cost basically nothing.
     if not minimal:
+        apply_smali_pin_patches(unpacked)
+
+    if not minimal:
+        # Try reFlutter's static libflutter swap before the Frida hooks go in.
+        # If it sticks, Flutter apps that detect Frida still have pinning off.
+        try_patch_flutter_static(unpacked, inspection, refresh=refresh)
+
         inject_frida_gadget(
             unpacked,
             inspection,
@@ -799,6 +1151,9 @@ def run_pipeline(
 
 def _collect_apks(path: Path) -> list[Path]:
     if path.is_file():
+        if path.suffix.lower() in BUNDLE_EXTENSIONS:
+            bundle_dir = extract_bundle(path)
+            return sorted(bundle_dir.glob("*.apk"))
         return [path]
     if path.is_dir():
         return sorted(path.glob("*.apk"))
