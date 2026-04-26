@@ -99,6 +99,7 @@ QN_DEBUG = f"{{{ANDROID_NS}}}debuggable"
 QN_CLEAR = f"{{{ANDROID_NS}}}usesCleartextTraffic"
 QN_EXTRACT = f"{{{ANDROID_NS}}}extractNativeLibs"
 QN_NAME = f"{{{ANDROID_NS}}}name"
+QN_APP_COMPONENT_FACTORY = f"{{{ANDROID_NS}}}appComponentFactory"
 
 FRIDA_ABI_MAP = {
     "arm64-v8a": "android-arm64",
@@ -211,6 +212,16 @@ def _run(cmd: list, *, check: bool = True, capture: bool = False) -> sp.Complete
     return sp.run(list(map(str, cmd)), check=check, text=True, capture_output=capture)
 
 
+# Big apps (Western Union, banking apps with 10+ dex files) blow out the JVM
+# default heap and apktool / signer get OOM-killed. Override via env.
+_JVM_HEAP = os.environ.get("DECLAW_JVM_HEAP", "4g")
+
+
+def _java(*args: str) -> list:
+    """Build a `java -Xmx... -jar ... <args>` command line."""
+    return ["java", f"-Xmx{_JVM_HEAP}", *args]
+
+
 # --------------------------------------------------------------------------- #
 #  Network / caching                                                          #
 # --------------------------------------------------------------------------- #
@@ -264,6 +275,10 @@ def fetch_bundletool(*, refresh: bool) -> Path:
     return dest
 
 
+def _bundletool_cmd(jar: Path, *args: str) -> list:
+    return _java("-jar", str(jar), *args)
+
+
 def convert_aab(aab: Path, *, refresh: bool) -> Path:
     """Convert a Google .aab into a universal .apks set via bundletool.
 
@@ -278,13 +293,13 @@ def convert_aab(aab: Path, *, refresh: bool) -> Path:
     out_dir.mkdir(parents=True)
     apks_out = out_dir / f"{aab.stem}.apks"
     log.info("Converting %s to universal APKs via bundletool", aab.name)
-    _run([
-        "java", "-jar", bundletool_jar,
+    _run(_bundletool_cmd(
+        bundletool_jar,
         "build-apks",
         f"--bundle={aab}",
         f"--output={apks_out}",
         "--mode=universal",
-    ])
+    ))
     return apks_out
 
 
@@ -520,6 +535,17 @@ def patch_manifest(unpacked: Path) -> ManifestPatchResult:
         if application.get(attr) != value:
             application.set(attr, value)
             changes.append(attr.split("}")[1])
+
+    # Apktool sometimes fails to resolve a resource-referenced
+    # `android:appComponentFactory` and writes a bare integer instead of the
+    # real class name. Reinstalling such an APK leaves Android trying to load
+    # `<package>.<int>` and crashing on launch. Replacing the value with the
+    # platform default keeps the app loadable; a pentested APK doesn't need a
+    # custom component factory.
+    acf = application.get(QN_APP_COMPONENT_FACTORY)
+    if acf is not None and (acf.isdigit() or "." not in acf):
+        application.set(QN_APP_COMPONENT_FACTORY, "androidx.core.app.CoreComponentFactory")
+        changes.append("appComponentFactory(reset)")
 
     app_fq = None
     app_class = application.get(QN_NAME)
@@ -1004,17 +1030,17 @@ def try_patch_flutter_static(
 def apktool_decode(apk: Path, out_dir: Path, jar: Path, *, with_sources: bool) -> None:
     if out_dir.exists():
         shutil.rmtree(out_dir)
-    cmd = ["java", "-jar", jar, "d", "-f", "-o", out_dir]
+    cmd = _java("-jar", str(jar), "d", "-f", "-o", str(out_dir))
     if not with_sources:
         cmd.append("-s")
-    cmd.append(apk)
+    cmd.append(str(apk))
     log.info("Unpacking %s (sources=%s)", apk.name, "yes" if with_sources else "no")
     _run(cmd)
 
 
 def apktool_build(unpacked: Path, out_apk: Path, jar: Path) -> None:
     log.info("Repacking -> %s", out_apk.name)
-    _run(["java", "-jar", jar, "b", "-f", unpacked, "-o", out_apk])
+    _run(_java("-jar", str(jar), "b", "-f", str(unpacked), "-o", str(out_apk)))
 
 
 _SIGNED_SUFFIX_RE = re.compile(r"-aligned-(?:debugSigned|signed)\.apk$")
@@ -1022,7 +1048,7 @@ _SIGNED_SUFFIX_RE = re.compile(r"-aligned-(?:debugSigned|signed)\.apk$")
 
 def sign_apk(apk: Path, signer_jar: Path) -> Path:
     log.info("Signing %s", apk.name)
-    _run(["java", "-jar", signer_jar, "-a", apk, "--allowResign", "--overwrite"])
+    _run(_java("-jar", str(signer_jar), "-a", str(apk), "--allowResign", "--overwrite"))
     if apk.exists():
         return apk
     for sib in apk.parent.iterdir():
