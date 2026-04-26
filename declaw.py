@@ -42,6 +42,7 @@ import re
 import shutil
 import subprocess as sp
 import sys
+import uuid
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -50,7 +51,7 @@ from pathlib import Path
 from typing import Optional
 
 import requests
-from xml.etree import ElementTree as _stdlib_ET  # for register_namespace only
+from xml.etree import ElementTree as _stdlib_ET
 from defusedxml import ElementTree as ET
 
 try:
@@ -107,19 +108,12 @@ FRIDA_ABI_MAP = {
     "x86_64": "android-x86_64",
 }
 
-# Non-obvious gadget library name (stealth). Evades the common
-# /proc/self/maps grep-for-"frida-gadget" anti-Frida check. Everything
-# (smali loader, gadget .so, config, script) uses this name.
+# Stealth name for the gadget. Defeats /proc/self/maps grep-for-frida-gadget.
 GADGET_LIBNAME = os.environ.get("DECLAW_GADGET_LIBNAME", "app-support")
 
-# Bundle container formats we can unpack into a split-APK directory.
 BUNDLE_EXTENSIONS = {".xapk", ".apks", ".apkm", ".apkmos"}
-# Google App Bundles are handled separately: bundletool converts them to a
-# universal .apks first, then we extract it like any other bundle.
 AAB_EXTENSION = ".aab"
 
-# reFlutter uses one release per known Flutter engine snapshot hash,
-# tagged "android-v2-<hash>" with libflutter_<arch>.so assets.
 REFLUTTER_CSV_URL = "https://raw.githubusercontent.com/Impact-I/reFlutter/main/enginehash.csv"
 REFLUTTER_RELEASE_URL = "https://github.com/Impact-I/reFlutter/releases/download/android-v2-{hash}/libflutter_{arch}.so"
 REFLUTTER_ABI_MAP = {
@@ -127,15 +121,10 @@ REFLUTTER_ABI_MAP = {
     "armeabi-v7a": "arm",
     "armeabi": "arm",
 }
-# Skip reFlutter's static patch on engines < 3.24.0: those had a hardcoded
-# Burp proxy IP baked in, which would redirect traffic whether we wanted it
-# or not. On 3.24.0+ the engine is cert-bypass only.
+# Engines below 3.24.0 had a hardcoded Burp proxy baked in; we'd redirect
+# traffic whether the user wanted it or not. Gate the static patch on this.
 REFLUTTER_MIN_VERSION = (3, 24, 0)
 
-# Well-known SSL-pinning classes in the Java layer. For each one we look
-# for a file at smali*/<class>.smali and stub the named method with
-# `return-void`. This is the apk-mitm style backup that keeps working
-# even when Frida is blocked at runtime.
 SMALI_PIN_TARGETS = [
     ("okhttp3/CertificatePinner", "check"),
     ("com/datatheorem/android/trustkit/pinning/PinningTrustManager", "checkServerTrusted"),
@@ -159,10 +148,8 @@ NETWORK_SECURITY_CONFIG_XML = """\
 </network-security-config>
 """
 
-# Dummy CA (ISRG Root X1). Parses cleanly so the httptoolkit hooks that do
-# CertificateFactory.generateCertificate(CERT_PEM) never throw; safe to inject
-# into any trust store since the device already trusts LE anyway. Overridden
-# if the user passes --cert or sets DECLAW_CERT_PEM.
+# ISRG Root X1. Parses cleanly so CertificateFactory.generateCertificate
+# inside the bundled hooks never throws when the user didn't pass --cert.
 DEFAULT_CERT_PEM = """\
 -----BEGIN CERTIFICATE-----
 MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
@@ -345,10 +332,8 @@ def fetch_bypass_script(cert_pem: str, *, refresh: bool) -> Path:
 
 
 def _read_cached_parts(cached: Path) -> list[tuple[str, str]]:
-    # Cache only stores the final concatenated file; returning empty parts
-    # forces _write_bypass to just refresh the header while preserving body.
+    # Strip the previous declaw header so re-writing is idempotent.
     body = cached.read_text(encoding="utf-8")
-    # Strip any previous declaw header so re-writing is idempotent.
     marker = "// ---- declaw header end ----"
     idx = body.find(marker)
     if idx >= 0:
@@ -683,15 +668,24 @@ def inject_frida_gadget(
             else:
                 log.info("Gadget loader already present in %s", target_class)
             loaded = True
-    if not loaded:
-        # Fallback: synthesize our own Application class that subclasses the
-        # original (or android.app.Application) and loads the gadget in its clinit.
-        inject_application_wrapper(unpacked, manifest.application_class)
-        loaded = True
 
-    # Defence in depth: also drop a ContentProvider that loads the gadget.
-    # ContentProviders are instantiated before Application.onCreate(), so
-    # the gadget attaches even if something skips the Application path.
+    if not loaded:
+        # Only synthesize the wrapper when there is no original Application
+        # class. Subclassing one whose smali we couldn't locate would crash
+        # at launch with NoClassDefFoundError.
+        if manifest.application_class is None:
+            inject_application_wrapper(unpacked, None)
+            loaded = True
+        else:
+            log.warning(
+                "Could not locate smali for %s. Skipping Application wrapper; "
+                "the gadget will load via the ContentProvider path only.",
+                manifest.application_class,
+            )
+
+    # Belt-and-braces: a ContentProvider is constructed before
+    # Application.onCreate(), so it loads the gadget even if the
+    # Application path is skipped.
     inject_content_provider(unpacked)
 
 
@@ -724,6 +718,11 @@ def extract_bundle(bundle_path: Path) -> Path:
             except OSError:
                 pass
     found = sorted(out_dir.glob("*.apk"))
+    if not found:
+        raise RuntimeError(
+            f"No .apk files inside bundle {bundle_path.name}. "
+            "Is this a valid .xapk / .apks / .apkm container?"
+        )
     log.info("Extracted %d APK(s) from bundle", len(found))
     return out_dir
 
@@ -832,18 +831,28 @@ def inject_content_provider(unpacked: Path) -> None:
     application = root.find(".//application")
     if application is None:
         return
-    pkg = root.get("package", "declaw.preload")
+
+    # Authority must be unique across all installed apps, and must not start
+    # with a dot (Android rejects that). apktool sometimes drops manifest@package
+    # on modern builds, hence the empty-string fallback.
+    pkg = (root.get("package") or "").strip()
+    salt = uuid.uuid4().hex[:8]
+    if pkg:
+        authority = f"{pkg}.declaw.preload.{salt}"
+    else:
+        log.warning("Manifest@package is empty; using a self-contained "
+                    "authority for the ContentProvider.")
+        authority = f"declaw.preload.{salt}"
 
     # Don't inject twice.
     for prov in application.findall("provider"):
         if prov.get(QN_NAME) == _PROVIDER_CLASS.replace("/", "."):
             return
 
-    # defusedxml doesn't export SubElement (it's a creation helper, not a
-    # parsing primitive); use stdlib for this.
+    # SubElement lives in stdlib ET (defusedxml only wraps parsing).
     provider = _stdlib_ET.SubElement(application, "provider")
     provider.set(QN_NAME, _PROVIDER_CLASS.replace("/", "."))
-    provider.set(f"{{{ANDROID_NS}}}authorities", f"{pkg}.declaw.preload")
+    provider.set(f"{{{ANDROID_NS}}}authorities", authority)
     provider.set(f"{{{ANDROID_NS}}}exported", "false")
     tree.write(manifest_path, encoding="utf-8", xml_declaration=True)
 
@@ -1005,8 +1014,6 @@ def apktool_decode(apk: Path, out_dir: Path, jar: Path, *, with_sources: bool) -
 
 def apktool_build(unpacked: Path, out_apk: Path, jar: Path) -> None:
     log.info("Repacking -> %s", out_apk.name)
-    # Apktool 2.x understood --use-aapt2; 3.x uses aapt2 by default and removed
-    # the flag. Leaving it off works for both.
     _run(["java", "-jar", jar, "b", "-f", unpacked, "-o", out_apk])
 
 
@@ -1038,11 +1045,14 @@ def install_apks(serial: str, apks: list[Path]) -> None:
     ]
     for flags in attempts:
         try:
-            _run(flags + list(map(str, ordered)))
+            _run(flags + list(map(str, ordered)), capture=True)
             log.info("Installed %d APK(s) on %s", len(ordered), serial)
             return
         except sp.CalledProcessError as e:
-            log.warning("install-multiple failed (%s), trying next flag set.", e.returncode)
+            stderr = (e.stderr or "").strip()
+            stdout = (e.stdout or "").strip()
+            detail = stderr or stdout or f"exit {e.returncode}"
+            log.warning("install-multiple failed: %s. Trying next strategy.", detail)
 
     log.info("Falling back to pm install session …")
     total = sum(a.stat().st_size for a in ordered)
@@ -1071,15 +1081,13 @@ def install_apks(serial: str, apks: list[Path]) -> None:
 class Tools:
     apktool: Path
     signer: Path
-    bypass_script: Path  # may be unused in --minimal mode
+    bypass_script: Optional[Path]  # None in --minimal mode
 
 
 def prepare_tools(*, refresh: bool, minimal: bool, cert_pem: str) -> Tools:
     apktool = _cached_jar(APKTOOL_URL, refresh=refresh)
     signer = _cached_jar(UBER_APK_SIGNER_URL, refresh=refresh)
-    bypass = UTILS_DIR / "universal-bypass.js"
-    if not minimal:
-        bypass = fetch_bypass_script(cert_pem, refresh=refresh)
+    bypass = None if minimal else fetch_bypass_script(cert_pem, refresh=refresh)
     return Tools(apktool, signer, bypass)
 
 
@@ -1103,16 +1111,11 @@ def patch_base_apk(
     manifest_info = patch_manifest(unpacked)
     add_network_security_config(unpacked)
 
-    # Always apply the cheap Java-layer smali patches; they give us a static
-    # fallback for when Frida is blocked, and they cost basically nothing.
     if not minimal:
         apply_smali_pin_patches(unpacked)
-
-    if not minimal:
-        # Try reFlutter's static libflutter swap before the Frida hooks go in.
-        # If it sticks, Flutter apps that detect Frida still have pinning off.
+        # Static libflutter swap first; if it lands, the Frida hooks below
+        # become a backstop instead of the only line of defence.
         try_patch_flutter_static(unpacked, inspection, refresh=refresh)
-
         inject_frida_gadget(
             unpacked,
             inspection,
