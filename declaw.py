@@ -661,8 +661,16 @@ def inject_frida_gadget(
     *,
     bypass_script: Path,
     refresh: bool,
+    extra_abis: Optional[set[str]] = None,
 ) -> None:
-    target_abis = sorted(inspection.abis) or ["arm64-v8a"]
+    # Detected ABIs plus any caller-requested extras. Useful when the source
+    # APK is single-arch (e.g. arm64-v8a from a Pixel) but we want to install
+    # on a different-arch sandbox (e.g. x86_64 emulator). Android picks the
+    # matching lib/<abi>/ at install time, so the unused gadget never loads.
+    target_abis = set(inspection.abis)
+    if extra_abis:
+        target_abis |= extra_abis
+    target_abis = sorted(target_abis) or ["arm64-v8a"]
 
     lib_root = unpacked / "lib"
     lib_root.mkdir(exist_ok=True)
@@ -1108,13 +1116,16 @@ class Tools:
     apktool: Path
     signer: Path
     bypass_script: Optional[Path]  # None in --minimal mode
+    extra_abis: set[str] = field(default_factory=set)
 
 
-def prepare_tools(*, refresh: bool, minimal: bool, cert_pem: str) -> Tools:
+def prepare_tools(
+    *, refresh: bool, minimal: bool, cert_pem: str, extra_abis: set[str]
+) -> Tools:
     apktool = _cached_jar(APKTOOL_URL, refresh=refresh)
     signer = _cached_jar(UBER_APK_SIGNER_URL, refresh=refresh)
     bypass = None if minimal else fetch_bypass_script(cert_pem, refresh=refresh)
-    return Tools(apktool, signer, bypass)
+    return Tools(apktool, signer, bypass, extra_abis)
 
 
 def patch_base_apk(
@@ -1148,6 +1159,7 @@ def patch_base_apk(
             manifest_info,
             bypass_script=tools.bypass_script,
             refresh=refresh,
+            extra_abis=tools.extra_abis,
         )
 
     repacked = out_dir / "base.repack.apk"
@@ -1207,11 +1219,14 @@ def run_pipeline(
     minimal: bool,
     refresh: bool,
     cert_pem: str,
+    extra_abis: set[str],
 ) -> int:
     target_path = Path(target)
     local_mode = target_path.exists()
 
-    tools = prepare_tools(refresh=refresh, minimal=minimal, cert_pem=cert_pem)
+    tools = prepare_tools(
+        refresh=refresh, minimal=minimal, cert_pem=cert_pem, extra_abis=extra_abis
+    )
 
     if local_mode:
         return _run_local_mode(target_path, tools, output=output,
@@ -1335,6 +1350,10 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("-c", "--cert",
                    help="Path to a PEM to embed as CERT_PEM (e.g. Burp / mitmproxy CA). "
                         "Overrides DECLAW_CERT_PEM env var.")
+    p.add_argument("--gadget-abis", metavar="LIST", default="",
+                   help="Comma-separated extra ABIs to inject the gadget into "
+                        "(e.g. x86_64 when patching a Pixel arm64 APK for an "
+                        "x86_64 emulator). Combined with what's in the APK.")
     p.add_argument("--minimal", action="store_true",
                    help="NSC only. Skip the Frida gadget, keep the APK small.")
     p.add_argument("--refresh", action="store_true",
@@ -1367,6 +1386,11 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     cert_pem = load_cert_pem(args)
 
+    abi_src = (args.gadget_abis or os.environ.get("DECLAW_GADGET_ABIS", "")).strip()
+    extra_abis = {a.strip() for a in abi_src.split(",") if a.strip()}
+    if extra_abis:
+        log.info("Extra gadget ABIs requested: %s", ", ".join(sorted(extra_abis)))
+
     try:
         return run_pipeline(
             target=args.target,
@@ -1375,6 +1399,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             minimal=args.minimal,
             refresh=args.refresh,
             cert_pem=cert_pem,
+            extra_abis=extra_abis,
         )
     except requests.RequestException as exc:
         log.error("Network error: %s", exc)
