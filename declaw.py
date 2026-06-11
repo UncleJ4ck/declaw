@@ -74,8 +74,20 @@ ADB_PORT = int(os.environ.get("ADB_PORT", "5037"))
 
 APKTOOL_URL = "https://api.github.com/repos/iBotPeaches/Apktool/releases/latest"
 UBER_APK_SIGNER_URL = "https://api.github.com/repos/patrickfav/uber-apk-signer/releases/latest"
-FRIDA_RELEASES_URL = "https://api.github.com/repos/frida/frida/releases/latest"
 BUNDLETOOL_URL = "https://api.github.com/repos/google/bundletool/releases/latest"
+
+# Frida 17.x gadget script mode is BROKEN on Android. The gadget loads, parses
+# the config, but never executes the JS script. Issue is tracked upstream:
+#   https://github.com/frida/frida/issues/3526
+#   https://github.com/frida/frida/issues/3645
+# Symptom: console.log / Java.perform / setImmediate all silently no-op.
+# Root cause: an ART change in late 2024 that the 17.x gadget runtime hasn't
+# adapted to. 16.7.19 (May 2025) is the last release where script mode works.
+# We pin to that until upstream ships a real fix. Override with --frida-version
+# or DECLAW_FRIDA_VERSION when a known-good 17.x lands.
+DEFAULT_FRIDA_VERSION = "16.7.19"
+FRIDA_RELEASES_TAG_URL = "https://api.github.com/repos/frida/frida/releases/tags/{tag}"
+FRIDA_RELEASES_LATEST_URL = "https://api.github.com/repos/frida/frida/releases/latest"
 
 DEFAULT_BYPASS_URLS = [
     "https://raw.githubusercontent.com/httptoolkit/frida-interception-and-unpinning/main/android/android-certificate-unpinning.js",
@@ -83,7 +95,17 @@ DEFAULT_BYPASS_URLS = [
     "https://raw.githubusercontent.com/httptoolkit/frida-interception-and-unpinning/main/android/android-disable-flutter-certificate-pinning.js",
     "https://raw.githubusercontent.com/httptoolkit/frida-interception-and-unpinning/main/android/android-disable-root-detection.js",
     "https://raw.githubusercontent.com/httptoolkit/frida-interception-and-unpinning/main/native-tls-hook.js",
+    # Required for Flutter and any app that ignores the system proxy:
+    # rewrites connect() at the libc level so all TCP lands on PROXY_HOST:PORT.
+    "https://raw.githubusercontent.com/httptoolkit/frida-interception-and-unpinning/main/native-connect-hook.js",
 ]
+
+# Sentinel checked in the cached bundle. If absent, the cache predates a URL
+# addition and must be rebuilt even without --refresh.
+BYPASS_CACHE_SENTINEL = "native-connect-hook.js"
+
+DEFAULT_PROXY_HOST = "127.0.0.1"
+DEFAULT_PROXY_PORT = 8000
 
 ROOT_DIR = Path(__file__).resolve().parent
 UTILS_DIR = ROOT_DIR / "utils"
@@ -186,11 +208,16 @@ emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
 """
 
 def _gadget_config_bytes() -> bytes:
+    # NOTE: do NOT set on_change="reload". On Android the gadget would then
+    # try to inotify the script directory under /data/app/<pkg>/lib/<abi>/,
+    # which SELinux denies for untrusted_app (avc: denied { watch } tclass=dir).
+    # The denial happens before the script ever runs, so every hook is silently
+    # skipped. We don't need hot-reload at runtime; the gadget reads the script
+    # once at process start and that's all that matters here.
     payload = {
         "interaction": {
             "type": "script",
             "path": f"./lib{GADGET_LIBNAME}.script.so",
-            "on_change": "reload",
         },
     }
     return json.dumps(payload, indent=2).encode("utf-8")
@@ -248,7 +275,29 @@ def _stream_download(url: str, dest: Path) -> None:
     tmp.rename(dest)
 
 
+_JAR_CACHE_PATTERNS = {
+    "iBotPeaches/Apktool": "apktool_*.jar",
+    "patrickfav/uber-apk-signer": "uber-apk-signer-*.jar",
+    "google/bundletool": "bundletool-*.jar",
+}
+
+
+def _existing_cached_jar(api_url: str) -> Optional[Path]:
+    for repo, pattern in _JAR_CACHE_PATTERNS.items():
+        if repo in api_url:
+            matches = sorted(UTILS_DIR.glob(pattern))
+            return matches[-1] if matches else None
+    return None
+
+
 def _cached_jar(api_url: str, *, refresh: bool) -> Path:
+    # Fast path: cached file already present and user did not ask to refresh.
+    # Avoids a GitHub API round-trip on every run (and lets declaw work offline).
+    if not refresh:
+        existing = _existing_cached_jar(api_url)
+        if existing is not None:
+            log.debug("Using cached %s", existing.name)
+            return existing
     info = _gh_latest(api_url)
     asset = next((a for a in info.get("assets", []) if a["name"].endswith(".jar")), None)
     if asset is None:
@@ -303,12 +352,38 @@ def convert_aab(aab: Path, *, refresh: bool) -> Path:
     return apks_out
 
 
-def fetch_frida_gadget(abi: str, *, refresh: bool) -> Path:
+def fetch_frida_gadget(abi: str, *, refresh: bool, version: str = DEFAULT_FRIDA_VERSION) -> Path:
     if abi not in FRIDA_ABI_MAP:
         raise ValueError(f"Unsupported ABI for Frida gadget: {abi}")
     suffix = FRIDA_ABI_MAP[abi]
-    info = _gh_latest(FRIDA_RELEASES_URL)
-    tag = info.get("tag_name", "latest").lstrip("v")
+    # Fast path: cached gadget for THIS version + ABI. Matching on version too
+    # because mixing a 16.x gadget with a 17.x cached one would reintroduce
+    # the script-mode-broken bug; we have to be specific.
+    pinned_so = UTILS_DIR / f"libfrida-gadget-{version}-{suffix}.so"
+    if pinned_so.exists() and not refresh:
+        log.debug("Using cached %s", pinned_so.name)
+        return pinned_so
+    # Fallback: any older cached version is better than failing on a flaky
+    # network, but warn loudly so the user knows they may be hitting the
+    # 17.x script-broken bug.
+    if not refresh:
+        matches = sorted(UTILS_DIR.glob(f"libfrida-gadget-*-{suffix}.so"))
+        if matches:
+            existing = matches[-1]
+            ver_in_name = existing.name.replace("libfrida-gadget-", "").replace(f"-{suffix}.so", "")
+            if ver_in_name != version:
+                log.warning(
+                    "Using cached %s (wanted %s). Pass --refresh to fetch the "
+                    "pinned version. If gadget script silently fails to run, "
+                    "this mismatch is likely why.",
+                    existing.name, version,
+                )
+            return existing
+    if version.lower() == "latest":
+        info = _gh_latest(FRIDA_RELEASES_LATEST_URL)
+    else:
+        info = _gh_latest(FRIDA_RELEASES_TAG_URL.format(tag=version))
+    tag = info.get("tag_name", version).lstrip("v")
     pattern = re.compile(rf"frida-gadget-.*{re.escape(suffix)}\.so\.xz$")
     asset = next((a for a in info.get("assets", []) if pattern.search(a["name"])), None)
     if asset is None:
@@ -326,16 +401,33 @@ def fetch_frida_gadget(abi: str, *, refresh: bool) -> Path:
     return so
 
 
-def fetch_bypass_script(cert_pem: str, *, refresh: bool) -> Path:
+def fetch_bypass_script(
+    cert_pem: str,
+    *,
+    refresh: bool,
+    proxy_host: str,
+    proxy_port: int,
+    debug_bundle: bool = False,
+) -> Path:
     """Assemble the universal bypass JS and return the cached path."""
     urls_env = os.environ.get("DECLAW_BYPASS_URLS", "").strip()
     urls = [u for u in urls_env.split(";") if u] if urls_env else list(DEFAULT_BYPASS_URLS)
     cached = UTILS_DIR / "universal-bypass.js"
 
-    if cached.exists() and not refresh:
+    stale = (
+        cached.exists()
+        and not urls_env
+        and BYPASS_CACHE_SENTINEL not in cached.read_text(encoding="utf-8", errors="ignore")
+    )
+    if stale:
+        log.info("Cached bypass bundle is missing %s; rebuilding.", BYPASS_CACHE_SENTINEL)
+
+    if cached.exists() and not refresh and not stale:
         log.debug("Using cached %s", cached.name)
-        # Still rewrite the header (CERT_PEM may have changed between runs).
-        return _write_bypass(cached, cert_pem, _read_cached_parts(cached))
+        # Still rewrite the header (CERT_PEM / proxy / DEBUG_MODE may have changed).
+        return _write_bypass(cached, cert_pem, _read_cached_parts(cached),
+                             proxy_host=proxy_host, proxy_port=proxy_port,
+                             debug_bundle=debug_bundle)
 
     parts: list[tuple[str, str]] = []
     for url in urls:
@@ -343,7 +435,9 @@ def fetch_bypass_script(cert_pem: str, *, refresh: bool) -> Path:
         r = requests.get(url, timeout=60)
         r.raise_for_status()
         parts.append((url, r.text))
-    return _write_bypass(cached, cert_pem, parts)
+    return _write_bypass(cached, cert_pem, parts,
+                         proxy_host=proxy_host, proxy_port=proxy_port,
+                         debug_bundle=debug_bundle)
 
 
 def _read_cached_parts(cached: Path) -> list[tuple[str, str]]:
@@ -356,8 +450,16 @@ def _read_cached_parts(cached: Path) -> list[tuple[str, str]]:
     return [("(cached)", body)]
 
 
-def _write_bypass(cached: Path, cert_pem: str, parts: list[tuple[str, str]]) -> Path:
-    header = _bypass_header(cert_pem)
+def _write_bypass(
+    cached: Path,
+    cert_pem: str,
+    parts: list[tuple[str, str]],
+    *,
+    proxy_host: str,
+    proxy_port: int,
+    debug_bundle: bool = False,
+) -> Path:
+    header = _bypass_header(cert_pem, proxy_host, proxy_port, debug_bundle)
     with open(cached, "w", encoding="utf-8") as fh:
         fh.write(header)
         for url, body in parts:
@@ -368,20 +470,85 @@ def _write_bypass(cached: Path, cert_pem: str, parts: list[tuple[str, str]]) -> 
     return cached
 
 
-def _bypass_header(cert_pem: str) -> str:
+def _bypass_header(cert_pem: str, proxy_host: str, proxy_port: int,
+                   debug_bundle: bool = False) -> str:
     escaped_pem = cert_pem.strip()
+    debug_flag = "true" if debug_bundle else "false"
+    # When debug_bundle is on, route every console.log through android.util.Log
+    # so output is visible under `adb logcat -s declaw:V`. Without this the
+    # gadget's console output goes to a buffer that never reaches logcat.
+    # File beacon written from the JS thread immediately, no Java needed.
+    # Frida's File API is sync and always present, so this proves the script
+    # actually executed. Path is the app's private files dir, world-unreadable
+    # but readable via `adb shell run-as <pkg>` (works because manifest sets
+    # debuggable=true).
+    beacon_block = (
+        "// ---- declaw debug beacon ----\n"
+        "(function(){ try {\n"
+        "  const ts = new Date().toISOString();\n"
+        "  const path = '/data/data/' + (Process.id ? '' : '') "
+        "+ (Java.androidVersion ? '' : '') + '';\n"
+        "  // Best-effort write; package dir is the app's own writable area.\n"
+        "  const f = new File('/data/local/tmp/declaw-alive.log', 'a');\n"
+        "  f.write('[' + ts + '] declaw script loaded, proxy=' + PROXY_HOST + ':' + PROXY_PORT + '\\n');\n"
+        "  f.flush(); f.close();\n"
+        "} catch (e) {\n"
+        "  try {\n"
+        "    const f2 = new File('/sdcard/declaw-alive.log', 'a');\n"
+        "    f2.write('beacon err: ' + e + '\\n'); f2.flush(); f2.close();\n"
+        "  } catch (e2) {}\n"
+        "} })();\n"
+        "// Then also try the Log.d bridge for the Java-ready case.\n"
+        "setImmediate(function () { try { Java.perform(function () {\n"
+        "  try {\n"
+        "    const Log = Java.use('android.util.Log');\n"
+        "    Log.d('declaw', 'bundle alive, proxy=' + PROXY_HOST + ':' + PROXY_PORT);\n"
+        "    const __orig = console.log;\n"
+        "    console.log = function () {\n"
+        "      const m = Array.prototype.slice.call(arguments).join(' ');\n"
+        "      try { Log.d('declaw', m); } catch (e) {}\n"
+        "      try { __orig.apply(console, arguments); } catch (e) {}\n"
+        "    };\n"
+        "  } catch (e) {}\n"
+        "}); } catch (e) {} });\n"
+        "// ---- end debug beacon ----\n"
+    )
+    debug_block = beacon_block if debug_bundle else ""
     return (
         "// declaw universal SSL-unpinning bundle\n"
         "// Generated header. Downstream hooks read these globals.\n"
         f"const CERT_PEM = `\n{escaped_pem}\n`;\n"
-        "const PROXY_HOST = '127.0.0.1';\n"
-        "const PROXY_PORT = 8000;\n"
-        "const DEBUG_MODE = false;\n"
+        f"const PROXY_HOST = '{proxy_host}';\n"
+        f"const PROXY_PORT = {proxy_port};\n"
+        f"const DEBUG_MODE = {debug_flag};\n"
         "const IGNORED_NON_HTTP_PORTS = [];\n"
         "const BLOCK_HTTP3 = true;\n"
         "const PROXY_SUPPORTS_SOCKS5 = false;\n"
+        f"{debug_block}"
         "// ---- declaw header end ----\n"
     )
+
+
+def parse_proxy(spec: str) -> tuple[str, int]:
+    """Parse HOST:PORT. Accepts 'host:port' or 'host port'."""
+    text = spec.strip()
+    if not text:
+        return DEFAULT_PROXY_HOST, DEFAULT_PROXY_PORT
+    sep = ":" if ":" in text else (" " if " " in text else None)
+    if sep is None:
+        log.error("--proxy expects HOST:PORT, got %r", spec)
+        sys.exit(2)
+    host, _, port_s = text.partition(sep)
+    host = host.strip()
+    try:
+        port = int(port_s.strip())
+    except ValueError:
+        log.error("--proxy port is not an integer: %r", port_s)
+        sys.exit(2)
+    if not host or not (1 <= port <= 65535):
+        log.error("--proxy host/port invalid: %r", spec)
+        sys.exit(2)
+    return host, port
 
 
 # --------------------------------------------------------------------------- #
@@ -662,6 +829,7 @@ def inject_frida_gadget(
     bypass_script: Path,
     refresh: bool,
     extra_abis: Optional[set[str]] = None,
+    frida_version: str = DEFAULT_FRIDA_VERSION,
 ) -> None:
     # Detected ABIs plus any caller-requested extras. Useful when the source
     # APK is single-arch (e.g. arm64-v8a from a Pixel) but we want to install
@@ -684,7 +852,7 @@ def inject_frida_gadget(
         if abi not in FRIDA_ABI_MAP:
             log.warning("Skipping unsupported ABI for gadget: %s", abi)
             continue
-        gadget_so = fetch_frida_gadget(abi, refresh=refresh)
+        gadget_so = fetch_frida_gadget(abi, refresh=refresh, version=frida_version)
         abi_dir = lib_root / abi
         abi_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy2(gadget_so, abi_dir / gadget_file)
@@ -1117,15 +1285,30 @@ class Tools:
     signer: Path
     bypass_script: Optional[Path]  # None in --minimal mode
     extra_abis: set[str] = field(default_factory=set)
+    frida_version: str = DEFAULT_FRIDA_VERSION
 
 
 def prepare_tools(
-    *, refresh: bool, minimal: bool, cert_pem: str, extra_abis: set[str]
+    *,
+    refresh: bool,
+    minimal: bool,
+    cert_pem: str,
+    extra_abis: set[str],
+    proxy_host: str,
+    proxy_port: int,
+    debug_bundle: bool = False,
+    frida_version: str = DEFAULT_FRIDA_VERSION,
 ) -> Tools:
     apktool = _cached_jar(APKTOOL_URL, refresh=refresh)
     signer = _cached_jar(UBER_APK_SIGNER_URL, refresh=refresh)
-    bypass = None if minimal else fetch_bypass_script(cert_pem, refresh=refresh)
-    return Tools(apktool, signer, bypass, extra_abis)
+    bypass = None if minimal else fetch_bypass_script(
+        cert_pem,
+        refresh=refresh,
+        proxy_host=proxy_host,
+        proxy_port=proxy_port,
+        debug_bundle=debug_bundle,
+    )
+    return Tools(apktool, signer, bypass, extra_abis, frida_version)
 
 
 def patch_base_apk(
@@ -1160,6 +1343,7 @@ def patch_base_apk(
             bypass_script=tools.bypass_script,
             refresh=refresh,
             extra_abis=tools.extra_abis,
+            frida_version=tools.frida_version,
         )
 
     repacked = out_dir / "base.repack.apk"
@@ -1220,12 +1404,23 @@ def run_pipeline(
     refresh: bool,
     cert_pem: str,
     extra_abis: set[str],
+    proxy_host: str,
+    proxy_port: int,
+    debug_bundle: bool = False,
+    frida_version: str = DEFAULT_FRIDA_VERSION,
 ) -> int:
     target_path = Path(target)
     local_mode = target_path.exists()
 
     tools = prepare_tools(
-        refresh=refresh, minimal=minimal, cert_pem=cert_pem, extra_abis=extra_abis
+        refresh=refresh,
+        minimal=minimal,
+        cert_pem=cert_pem,
+        extra_abis=extra_abis,
+        proxy_host=proxy_host,
+        proxy_port=proxy_port,
+        debug_bundle=debug_bundle,
+        frida_version=frida_version,
     )
 
     if local_mode:
@@ -1350,10 +1545,24 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("-c", "--cert",
                    help="Path to a PEM to embed as CERT_PEM (e.g. Burp / mitmproxy CA). "
                         "Overrides DECLAW_CERT_PEM env var.")
+    p.add_argument("--proxy", metavar="HOST:PORT",
+                   help="Proxy address baked into the bundled hooks. Required for "
+                        "Flutter and any app that ignores the system proxy (the "
+                        "native-connect hook redirects TCP here). Overrides "
+                        "DECLAW_PROXY env var. Default 127.0.0.1:8000.")
+    p.add_argument("--debug-bundle", action="store_true",
+                   help="Flip DEBUG_MODE=true in the bundled Frida script so every "
+                        "connect() rewrite and pinning hook gets logged. View with "
+                        "`adb logcat -s frida-gadget:*`.")
     p.add_argument("--gadget-abis", metavar="LIST", default="",
                    help="Comma-separated extra ABIs to inject the gadget into "
                         "(e.g. x86_64 when patching a Pixel arm64 APK for an "
                         "x86_64 emulator). Combined with what's in the APK.")
+    p.add_argument("--frida-version", metavar="X.Y.Z", default="",
+                   help=f"Pin Frida gadget version. Default {DEFAULT_FRIDA_VERSION} "
+                        f"because Frida 17.x gadget script mode is broken on Android "
+                        f"(silent no-op). Use 'latest' if upstream has shipped a fix. "
+                        f"Overrides DECLAW_FRIDA_VERSION env var.")
     p.add_argument("--minimal", action="store_true",
                    help="NSC only. Skip the Frida gadget, keep the APK small.")
     p.add_argument("--refresh", action="store_true",
@@ -1386,6 +1595,28 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     cert_pem = load_cert_pem(args)
 
+    proxy_spec = (args.proxy or os.environ.get("DECLAW_PROXY", "")).strip()
+    proxy_host, proxy_port = parse_proxy(proxy_spec)
+    if proxy_spec:
+        log.info("Bypass hooks will redirect TCP to %s:%d", proxy_host, proxy_port)
+    else:
+        log.debug("Using default proxy header %s:%d", proxy_host, proxy_port)
+
+    debug_bundle = bool(args.debug_bundle) or os.environ.get("DECLAW_DEBUG_BUNDLE", "").strip() not in ("", "0", "false", "False")
+    if debug_bundle:
+        log.info("DEBUG_MODE enabled in bundled script. Tail `adb logcat -s declaw:V`.")
+
+    frida_version = (args.frida_version or os.environ.get("DECLAW_FRIDA_VERSION", "")).strip() or DEFAULT_FRIDA_VERSION
+    if frida_version != DEFAULT_FRIDA_VERSION:
+        log.warning(
+            "Using non-default Frida version %s. The default %s is pinned because "
+            "Frida 17.x gadget script mode silently fails on Android (upstream "
+            "issues frida/frida#3526, #3645). If your script doesn't run, this is "
+            "likely the cause.", frida_version, DEFAULT_FRIDA_VERSION,
+        )
+    else:
+        log.debug("Frida gadget pinned to %s (script-mode known-good).", frida_version)
+
     abi_src = (args.gadget_abis or os.environ.get("DECLAW_GADGET_ABIS", "")).strip()
     extra_abis = {a.strip() for a in abi_src.split(",") if a.strip()}
     if extra_abis:
@@ -1400,6 +1631,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             refresh=args.refresh,
             cert_pem=cert_pem,
             extra_abis=extra_abis,
+            proxy_host=proxy_host,
+            proxy_port=proxy_port,
+            debug_bundle=debug_bundle,
+            frida_version=frida_version,
         )
     except requests.RequestException as exc:
         log.error("Network error: %s", exc)

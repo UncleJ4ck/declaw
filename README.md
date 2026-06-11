@@ -36,10 +36,15 @@ Given a package name or a local APK, declaw:
 The universal unpinning script is assembled from the public scripts in
 [`httptoolkit/frida-interception-and-unpinning`](https://github.com/httptoolkit/frida-interception-and-unpinning):
 certificate unpinning, the fallback hooks, the Flutter BoringSSL
-patcher, root-detection disable, and the native TLS hook. declaw
-prepends a small config stub with a valid dummy `CERT_PEM` so the hooks
-that read it don't throw; you can override the PEM with `-c` or
-`DECLAW_CERT_PEM` to embed your Burp or mitmproxy CA directly.
+patcher, root-detection disable, the native TLS hook, and the native
+`connect()` hook that redirects TCP to your proxy. The connect hook is
+what makes Flutter (and any other app that ignores Android's system
+proxy) reach Burp / mitmproxy in the first place. declaw prepends a
+small config stub with a valid dummy `CERT_PEM` so the hooks that read
+it don't throw; you can override the PEM with `-c` or `DECLAW_CERT_PEM`
+to embed your Burp or mitmproxy CA directly, and you must pass
+`--proxy HOST:PORT` (or `DECLAW_PROXY`) with the address of your
+listener for the connect hook to send traffic to the right place.
 
 All the downloaded tooling (apktool, uber-apk-signer, the gadget, the
 script bundle) gets cached under `utils/`. First run is the slow one.
@@ -56,6 +61,7 @@ declaw ./app.apks                         # SAI / bundletool split-APK set
 declaw ./app.aab                          # Google App Bundle (uses bundletool)
 declaw --minimal com.example.app          # NSC only, skip the gadget
 declaw -c ~/.mitmproxy/ca.pem com.bank    # bake in your proxy's CA
+declaw --proxy 192.168.1.10:8080 com.bank # redirect TCP to your laptop's proxy
 declaw --refresh com.example.app          # re-download every cached tool
 ```
 
@@ -70,6 +76,9 @@ package name and declaw will pull it over ADB.
 | `-s`, `--serial` | ADB serial. Only required when more than one device is attached. |
 | `-o`, `--output` | Copy the patched APKs into this directory (timestamped). |
 | `-c`, `--cert` | Path to a PEM to bake into `CERT_PEM` for the bundled hooks. |
+| `--proxy` | `HOST:PORT` of your intercepting proxy. Baked into the bundled `connect()` hook so Flutter and other proxy-ignoring apps route to it. |
+| `--frida-version` | Pin the Frida gadget version. Default `16.7.19` because Frida 17.x gadget script mode is broken on Android (silent no-op, upstream `frida/frida#3526`, `#3645`). Use `latest` only when upstream has shipped a fix. |
+| `--debug-bundle` | Flip `DEBUG_MODE=true` in the bundled hooks and bridge `console.log` to `Log.d("declaw", ...)` so output is visible under `adb logcat -s declaw:V`. |
 | `--minimal` | NSC only. Skip the gadget. Patched APK stays close to the original size. |
 | `--refresh` | Re-download everything cached in `utils/`. |
 | `-v`, `--verbose` | DEBUG logging. Shows every subprocess and cache hit. |
@@ -80,6 +89,9 @@ package name and declaw will pull it over ADB.
 |---|---|
 | `DECLAW_BYPASS_URLS` | `;` separated list of JS URLs to concatenate into the bundle. Overrides the default. |
 | `DECLAW_CERT_PEM` | Path to a PEM, used when `-c` is not passed. |
+| `DECLAW_PROXY` | `HOST:PORT` for the bundled `connect()` hook, used when `--proxy` is not passed. |
+| `DECLAW_FRIDA_VERSION` | Override the pinned Frida gadget version, used when `--frida-version` is not passed. |
+| `DECLAW_DEBUG_BUNDLE` | Truthy value (`1`, `true`) enables the debug bundle, used when `--debug-bundle` is not passed. |
 | `GITHUB_TOKEN` | Passed to the GitHub release API so the latest-release calls don't hit anonymous rate limits. |
 | `ADB_HOST`, `ADB_PORT` | Point at a non-default adb server. |
 
@@ -134,9 +146,15 @@ package:com.example.bank
    Security, Install certificate). Or pass `--cert ca.pem` to declaw
    and skip the install step entirely (the bundled hooks add it to the
    app's own trust store).
-2. Point the device at your proxy.
-3. Open the app. The gadget loads, the bundled script runs, pinning
-   stops mattering, your proxy sees cleartext.
+2. Pass `--proxy HOST:PORT` to declaw with your laptop's IP and the
+   Burp / mitmproxy listener port. The bundled `connect()` hook will
+   redirect every outbound TCP connection from the app to that address,
+   which is the only thing that gets Flutter and other proxy-ignoring
+   apps through your interceptor.
+3. (Optional) Also set Wi-Fi proxy on the device, so apps that *do*
+   honour system proxy treat it normally.
+4. Open the app. The gadget loads, the bundled script runs, pinning
+   stops mattering, `connect()` lands on your proxy, you see cleartext.
 
 If an app still doesn't talk to you after that, it's usually one of:
 
@@ -160,19 +178,6 @@ If an app still doesn't talk to you after that, it's usually one of:
 | 4 | Network error fetching tooling. |
 | 6 | apktool, signer, or adb failed. |
 | 130 | Ctrl-C. |
-
-## What I haven't tested
-
-The install path obviously needs a device. The runtime bypass needs a
-device and a target app to try against. The static side of the pipeline
-(pull, decode, patch, rebuild, sign) I've run end to end against
-F-Droid's own APK and inspected the output. Smali injection, gadget
-placement, and NSC all land correctly.
-
-If you try it against a Flutter app and the BoringSSL patch doesn't
-stick, grab `utils/universal-bypass.js` and check whether the Flutter
-script actually matched your app's libflutter.so. The upstream pattern
-matcher covers most versions but not every one.
 
 ## Credits
 
