@@ -100,9 +100,11 @@ DEFAULT_BYPASS_URLS = [
     "https://raw.githubusercontent.com/httptoolkit/frida-interception-and-unpinning/main/native-connect-hook.js",
 ]
 
-# Sentinel checked in the cached bundle. If absent, the cache predates a URL
-# addition and must be rebuilt even without --refresh.
-BYPASS_CACHE_SENTINEL = "native-connect-hook.js"
+# Sentinel checked in the cached bundle. If absent, the cache predates a
+# header addition (URL set OR hardening block) and must be rebuilt even
+# without --refresh. Bump this when you add a new hook to the header so
+# existing caches do not silently lack the new behaviour.
+BYPASS_CACHE_SENTINEL = "declaw hardening hooks"
 
 DEFAULT_PROXY_HOST = "127.0.0.1"
 DEFAULT_PROXY_PORT = 8000
@@ -514,6 +516,65 @@ def _bypass_header(cert_pem: str, proxy_host: str, proxy_port: int,
         "// ---- end debug beacon ----\n"
     )
     debug_block = beacon_block if debug_bundle else ""
+
+    # Small, high-value Java hooks the httptoolkit bundle does NOT cover.
+    # All wrapped with safeHook so a missing class can never take down the
+    # rest of the script (cf. "Too many hooks spoil the app", j4k0m, 2026).
+    # These fire BEFORE the httptoolkit fragments via setImmediate(Java.perform).
+    hardening_block = (
+        "// ---- declaw hardening hooks (NetCap, WebView, anti-debug) ----\n"
+        "setImmediate(function () { try { Java.perform(function () {\n"
+        "  const __declawTag = 'declaw';\n"
+        "  function safeHook(name, install) {\n"
+        "    try {\n"
+        "      install();\n"
+        "      try { Java.use('android.util.Log').d(__declawTag, '[hook] ' + name); } catch (e) {}\n"
+        "    } catch (error) {\n"
+        "      try { Java.use('android.util.Log').d(__declawTag,\n"
+        "        '[skip] ' + name + ': ' + (error.message || error)); } catch (e) {}\n"
+        "    }\n"
+        "  }\n"
+        "\n"
+        "  // 1) NetworkCapabilities.hasCapability(int), selective.\n"
+        "  // An inspection proxy can leave NET_CAPABILITY_INTERNET (12) present\n"
+        "  // but disturb NET_CAPABILITY_VALIDATED (16). Apps that gate requests\n"
+        "  // on both report 'offline' and never make calls; the connect-hook\n"
+        "  // then has nothing to redirect. Returning true for ONLY those two\n"
+        "  // preserves every other capability check (VPN, metered, transport).\n"
+        "  safeHook('NetworkCapabilities.hasCapability', function () {\n"
+        "    const NetCap = Java.use('android.net.NetworkCapabilities');\n"
+        "    const orig = NetCap.hasCapability.overload('int');\n"
+        "    orig.implementation = function (cap) {\n"
+        "      if (cap === 12 || cap === 16) return true;\n"
+        "      return orig.call(this, cap);\n"
+        "    };\n"
+        "  });\n"
+        "\n"
+        "  // 2) WebViewClient.onReceivedSslError, handler.proceed().\n"
+        "  // Covers any embedded WebView page that hits an SSL error against\n"
+        "  // the Burp / mitmproxy CA. Cheap, broad, no false positives because\n"
+        "  // it only runs when an SSL error already occurred.\n"
+        "  safeHook('WebViewClient.onReceivedSslError', function () {\n"
+        "    const WVC = Java.use('android.webkit.WebViewClient');\n"
+        "    WVC.onReceivedSslError.implementation = function (view, handler, error) {\n"
+        "      handler.proceed();\n"
+        "    };\n"
+        "  });\n"
+        "\n"
+        "  // 3) android.os.Debug status, suppress the reaction not the env.\n"
+        "  // Setting debuggable=true in the manifest makes some apps refuse to\n"
+        "  // run when isDebuggerConnected() / waitingForDebugger() return true.\n"
+        "  // Returning false from both is the smallest behavioural change.\n"
+        "  safeHook('Debug.isDebuggerConnected', function () {\n"
+        "    Java.use('android.os.Debug').isDebuggerConnected.implementation = function () { return false; };\n"
+        "  });\n"
+        "  safeHook('Debug.waitingForDebugger', function () {\n"
+        "    Java.use('android.os.Debug').waitingForDebugger.implementation = function () { return false; };\n"
+        "  });\n"
+        "}); } catch (e) {} });\n"
+        "// ---- end declaw hardening ----\n"
+    )
+
     return (
         "// declaw universal SSL-unpinning bundle\n"
         "// Generated header. Downstream hooks read these globals.\n"
@@ -525,6 +586,7 @@ def _bypass_header(cert_pem: str, proxy_host: str, proxy_port: int,
         "const BLOCK_HTTP3 = true;\n"
         "const PROXY_SUPPORTS_SOCKS5 = false;\n"
         f"{debug_block}"
+        f"{hardening_block}"
         "// ---- declaw header end ----\n"
     )
 
