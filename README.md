@@ -46,6 +46,32 @@ to embed your Burp or mitmproxy CA directly, and you must pass
 `--proxy HOST:PORT` (or `DECLAW_PROXY`) with the address of your
 listener for the connect hook to send traffic to the right place.
 
+On top of the httptoolkit fragments declaw prepends three small Java
+hooks, each wrapped in a `safeHook(name, install)` so a missing class
+cannot abort the rest of the bundle (logged as `[hook] X` or `[skip] X`
+under `adb logcat -s declaw:V`):
+
+- `NetworkCapabilities.hasCapability(int)`: returns true selectively
+  for `NET_CAPABILITY_INTERNET` (12) and `NET_CAPABILITY_VALIDATED`
+  (16) and falls through for every other capability. Android's
+  validation probe can flip VALIDATED to false when an inspection
+  proxy is in front, which makes apps gate their requests on a
+  "no internet" state. Returning true only for those two preserves
+  VPN, metered, transport and captive-portal accuracy. Without this,
+  the connect hook has nothing to redirect because the app never
+  attempts to connect.
+- `WebViewClient.onReceivedSslError`: calls `handler.proceed()` for
+  any embedded WebView that hits an SSL error against your proxy CA.
+- `Debug.isDebuggerConnected` / `Debug.waitingForDebugger`: both
+  return false so the `debuggable=true` flag declaw sets in the
+  manifest does not trip apps that gate on either.
+
+These three are useful for traffic interception and rarely cause side
+effects. If you do need to disable them (debugging the bundle itself,
+auditing one hook at a time), edit `_bypass_header` in `declaw.py`
+between the `// ---- declaw hardening hooks` and `// ---- end declaw
+hardening` markers.
+
 All the downloaded tooling (apktool, uber-apk-signer, the gadget, the
 script bundle) gets cached under `utils/`. First run is the slow one.
 
