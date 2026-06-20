@@ -602,6 +602,71 @@ def parse_proxy(spec: str) -> tuple[str, int]:
     return host, port
 
 
+def auto_detect_proxy_host(serial: Optional[str], default_port: int = DEFAULT_PROXY_PORT) -> Optional[tuple[str, int]]:
+    """Pick the best host alias the connected device can use to reach the
+    laptop's proxy listener. Emulators get the QEMU alias 10.0.2.2. Physical
+    phones get whichever host LAN IP shares a subnet with the phone's Wi-Fi
+    IP. Returns None when no device is reachable or the heuristic cannot
+    decide; caller falls back to DEFAULT_PROXY_HOST."""
+    try:
+        client = AdbClient(host=ADB_HOST, port=ADB_PORT)
+        devices = client.device_list()
+    except Exception as exc:
+        log.debug("auto-proxy: adb unreachable (%s)", exc)
+        return None
+    if not devices:
+        log.debug("auto-proxy: no adb devices")
+        return None
+    if serial:
+        devices = [d for d in devices if d.serial == serial]
+        if not devices:
+            return None
+    if len(devices) > 1:
+        log.debug("auto-proxy: multiple devices, pass -s SERIAL")
+        return None
+    d = devices[0]
+    # Emulator alias for the host loopback.
+    try:
+        is_emu = d.serial.startswith("emulator-") or d.shell("getprop ro.kernel.qemu").strip() == "1"
+    except Exception:
+        is_emu = d.serial.startswith("emulator-")
+    if is_emu:
+        log.info("auto-proxy: %s looks like an emulator, using 10.0.2.2:%d", d.serial, default_port)
+        return ("10.0.2.2", default_port)
+    # Physical device: pick the laptop's LAN IP on the same /24 as the phone.
+    try:
+        phone_ifaces = d.shell("ip -4 -o addr show 2>/dev/null").splitlines()
+    except Exception:
+        phone_ifaces = []
+    phone_ips = []
+    for line in phone_ifaces:
+        m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)/(\d+)", line)
+        if m and not m.group(1).startswith("127."):
+            phone_ips.append(m.group(1))
+    if not phone_ips:
+        return None
+    # Walk local interfaces, find one on the same /24 as any phone IP.
+    try:
+        host_out = sp.run(["ip", "-4", "-o", "addr", "show"], capture_output=True, text=True, check=True).stdout
+    except Exception:
+        return None
+    for line in host_out.splitlines():
+        m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)/(\d+)", line)
+        if not m:
+            continue
+        host_ip = m.group(1)
+        if host_ip.startswith("127."):
+            continue
+        host_prefix = ".".join(host_ip.split(".")[:3])
+        for pip in phone_ips:
+            if pip.startswith(host_prefix + "."):
+                log.info("auto-proxy: phone %s on %s/24, using host %s:%d",
+                         d.serial, host_prefix + ".0", host_ip, default_port)
+                return (host_ip, default_port)
+    log.debug("auto-proxy: no host iface shares a /24 with phone IPs %s", phone_ips)
+    return None
+
+
 # --------------------------------------------------------------------------- #
 #  Device / APK I/O                                                           #
 # --------------------------------------------------------------------------- #
@@ -1647,7 +1712,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     cert_pem = load_cert_pem(args)
 
     proxy_spec = (args.proxy or os.environ.get("DECLAW_PROXY", "")).strip()
-    proxy_host, proxy_port = parse_proxy(proxy_spec)
+    if not proxy_spec:
+        # No explicit proxy. Try to auto-detect from a connected device so
+        # the bundled connect hook actually targets a reachable address.
+        auto = auto_detect_proxy_host(args.serial)
+        if auto is not None:
+            proxy_host, proxy_port = auto
+        else:
+            proxy_host, proxy_port = parse_proxy("")
+    else:
+        proxy_host, proxy_port = parse_proxy(proxy_spec)
     if proxy_spec:
         log.info("Bypass hooks will redirect TCP to %s:%d", proxy_host, proxy_port)
     else:
