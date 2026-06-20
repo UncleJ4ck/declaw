@@ -1095,6 +1095,61 @@ _WRAPPER_CLASS = "com/declaw/DeclawApp"
 _PROVIDER_CLASS = "com/declaw/DeclawPreload"
 
 
+def _apktool_min_sdk(unpacked: Path) -> int:
+    """Best-effort minSdkVersion from apktool.yml. 0 if unknown."""
+    yml = unpacked / "apktool.yml"
+    if not yml.exists():
+        return 0
+    for line in yml.read_text(encoding="utf-8", errors="ignore").splitlines():
+        m = re.search(r"minSdkVersion:\s*['\"]?(\d+)", line)
+        if m:
+            return int(m.group(1))
+    return 0
+
+
+def _injection_smali_dir(unpacked: Path) -> Path:
+    """Where to write an injected class.
+
+    apktool maps `smali` -> classes.dex, `smali_classes2` -> classes2.dex, etc.
+    Large apps (Signal, banking, social) fill their first dex right up to the
+    64K method/field/type reference ceiling. Dropping a class into the existing
+    `smali` folder then tips that dex over the limit and apktool fails the
+    rebuild with "Unsigned short value out of range: 65536". Putting our class
+    in a brand-new dex folder gives it a full 64K of headroom.
+
+    But a *second* dex only loads at runtime when the app is multidex-capable:
+    API 21+ loads every classesN.dex natively; older apps need the multidex
+    support library, which a single-dex legacy app will not have. So only use a
+    fresh dex when it is safe:
+      - the app is already multidex (smali_classes2 exists), or
+      - minSdkVersion >= 21.
+    Otherwise fall back to `smali` (classes.dex). Single-dex legacy apps are
+    small and nowhere near the 64K ceiling, so the overflow cannot happen there.
+    """
+    dex_dirs = sorted(
+        p.name for p in unpacked.iterdir()
+        if p.is_dir() and re.fullmatch(r"smali(_classes\d+)?", p.name)
+    )
+    already_multidex = any(d != "smali" for d in dex_dirs)
+    min_sdk = _apktool_min_sdk(unpacked)
+
+    if not (already_multidex or min_sdk >= 21):
+        d = unpacked / "smali"
+        d.mkdir(exist_ok=True)
+        log.debug("Injecting into classes.dex (single-dex, minSdk=%d)", min_sdk)
+        return d
+
+    indices = [1]  # `smali` == dex index 1
+    for name in dex_dirs:
+        m = re.fullmatch(r"smali_classes(\d+)", name)
+        if m:
+            indices.append(int(m.group(1)))
+    nxt = max(indices) + 1
+    d = unpacked / f"smali_classes{nxt}"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def inject_application_wrapper(unpacked: Path, orig_app_class: Optional[str]) -> None:
     """Create a subclass Application that loads the gadget in <clinit> and
     rewrite android:name to point at it. Used when there's no existing
@@ -1119,8 +1174,9 @@ def inject_application_wrapper(unpacked: Path, orig_app_class: Optional[str]) ->
         ".end method\n"
     )
 
-    smali_root = unpacked / "smali"
-    smali_root.mkdir(exist_ok=True)
+    # Place into a fresh dex so a near-full classes.dex is never tipped over
+    # the 64K reference ceiling by our injected class.
+    smali_root = _injection_smali_dir(unpacked)
     out = smali_root / rel
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(smali, encoding="utf-8")
@@ -1220,13 +1276,15 @@ def inject_content_provider(unpacked: Path) -> None:
         ".end method\n"
     )
 
-    smali_root = unpacked / "smali"
-    smali_root.mkdir(exist_ok=True)
+    # Fresh dex when safe (see _injection_smali_dir): the provider is a whole
+    # class with a dozen method/type refs; appending it to a near-full
+    # classes.dex is what overflowed the rebuild on large apps like Signal.
+    smali_root = _injection_smali_dir(unpacked)
     out = smali_root / (_PROVIDER_CLASS + ".smali")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(smali, encoding="utf-8")
-    log.info("Injected ContentProvider %s for early gadget load",
-             _PROVIDER_CLASS.replace("/", "."))
+    log.info("Injected ContentProvider %s for early gadget load (%s)",
+             _PROVIDER_CLASS.replace("/", "."), smali_root.name)
 
 
 # --------------------------------------------------------------------------- #
