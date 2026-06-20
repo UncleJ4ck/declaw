@@ -367,20 +367,11 @@ def fetch_frida_gadget(abi: str, *, refresh: bool, version: str = DEFAULT_FRIDA_
         return pinned_so
     # Fallback: any older cached version is better than failing on a flaky
     # network, but warn loudly so the user knows they may be hitting the
-    # 17.x script-broken bug.
-    if not refresh:
-        matches = sorted(UTILS_DIR.glob(f"libfrida-gadget-*-{suffix}.so"))
-        if matches:
-            existing = matches[-1]
-            ver_in_name = existing.name.replace("libfrida-gadget-", "").replace(f"-{suffix}.so", "")
-            if ver_in_name != version:
-                log.warning(
-                    "Using cached %s (wanted %s). Pass --refresh to fetch the "
-                    "pinned version. If gadget script silently fails to run, "
-                    "this mismatch is likely why.",
-                    existing.name, version,
-                )
-            return existing
+    # 17.x script-broken bug. Real bug surfaced during the docker-android
+    # x86_64 test run: the pinned arm64 gadget was downloaded but the x86_64
+    # ABI silently fell back to a stale 17.x cache and the gadget script
+    # silently no-op'd in the emulator. Downloading the pinned version per
+    # ABI is the only correct behaviour; if the network is down, fail loudly.
     if version.lower() == "latest":
         info = _gh_latest(FRIDA_RELEASES_LATEST_URL)
     else:
