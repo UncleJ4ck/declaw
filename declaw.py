@@ -90,6 +90,14 @@ FRIDA_RELEASES_TAG_URL = "https://api.github.com/repos/frida/frida/releases/tags
 FRIDA_RELEASES_LATEST_URL = "https://api.github.com/repos/frida/frida/releases/latest"
 
 DEFAULT_BYPASS_URLS = [
+    # NVISO Flutter TLS bypass FIRST. It pattern-locates ssl_verify_peer_cert
+    # in libflutter's BoringSSL and patches it to return success, the only
+    # reliable defeat of Flutter's own-trust-store TLS. Ordered ahead of the
+    # httptoolkit fragments so its load-time kickoff and retry timer start
+    # earliest and can never be pre-empted by another fragment. Proven to
+    # decrypt Boursorama (real bank, Flutter 3.19) where the httptoolkit
+    # Flutter hook silently missed the function.
+    "https://raw.githubusercontent.com/NVISOsecurity/disable-flutter-tls-verification/main/disable-flutter-tls.js",
     "https://raw.githubusercontent.com/httptoolkit/frida-interception-and-unpinning/main/android/android-certificate-unpinning.js",
     "https://raw.githubusercontent.com/httptoolkit/frida-interception-and-unpinning/main/android/android-certificate-unpinning-fallback.js",
     "https://raw.githubusercontent.com/httptoolkit/frida-interception-and-unpinning/main/android/android-disable-flutter-certificate-pinning.js",
@@ -104,7 +112,7 @@ DEFAULT_BYPASS_URLS = [
 # header addition (URL set OR hardening block) and must be rebuilt even
 # without --refresh. Bump this when you add a new hook to the header so
 # existing caches do not silently lack the new behaviour.
-BYPASS_CACHE_SENTINEL = "declaw hardening hooks"
+BYPASS_CACHE_SENTINEL = "ssl_verify_peer_cert"
 
 DEFAULT_PROXY_HOST = "127.0.0.1"
 DEFAULT_PROXY_PORT = 8000
