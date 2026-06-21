@@ -89,30 +89,50 @@ DEFAULT_FRIDA_VERSION = "16.7.19"
 FRIDA_RELEASES_TAG_URL = "https://api.github.com/repos/frida/frida/releases/tags/{tag}"
 FRIDA_RELEASES_LATEST_URL = "https://api.github.com/repos/frida/frida/releases/latest"
 
-DEFAULT_BYPASS_URLS = [
+# Bypass fragments grouped by category so the bundle is assembled per app
+# from the frameworks actually detected, instead of always shipping every
+# hook. (url, category). Categories:
+#   "flutter-first" : Flutter BoringSSL bypass, must run before anything else
+#   "core"          : Java/native TLS hooks that apply to almost any Android app
+#   "flutter"       : extra Flutter hooks, only useful when libflutter is present
+_NVISO = "https://raw.githubusercontent.com/NVISOsecurity/disable-flutter-tls-verification/main/disable-flutter-tls.js"
+_HT = "https://raw.githubusercontent.com/httptoolkit/frida-interception-and-unpinning/main"
+BYPASS_FRAGMENTS = [
     # NVISO Flutter TLS bypass FIRST. It pattern-locates ssl_verify_peer_cert
     # in libflutter's BoringSSL and patches it to return success, the only
-    # reliable defeat of Flutter's own-trust-store TLS. Ordered ahead of the
-    # httptoolkit fragments so its load-time kickoff and retry timer start
-    # earliest and can never be pre-empted by another fragment. Proven to
-    # decrypt Boursorama (real bank, Flutter 3.19) where the httptoolkit
-    # Flutter hook silently missed the function.
-    "https://raw.githubusercontent.com/NVISOsecurity/disable-flutter-tls-verification/main/disable-flutter-tls.js",
-    "https://raw.githubusercontent.com/httptoolkit/frida-interception-and-unpinning/main/android/android-certificate-unpinning.js",
-    "https://raw.githubusercontent.com/httptoolkit/frida-interception-and-unpinning/main/android/android-certificate-unpinning-fallback.js",
-    "https://raw.githubusercontent.com/httptoolkit/frida-interception-and-unpinning/main/android/android-disable-flutter-certificate-pinning.js",
-    "https://raw.githubusercontent.com/httptoolkit/frida-interception-and-unpinning/main/android/android-disable-root-detection.js",
-    "https://raw.githubusercontent.com/httptoolkit/frida-interception-and-unpinning/main/native-tls-hook.js",
-    # Required for Flutter and any app that ignores the system proxy:
-    # rewrites connect() at the libc level so all TCP lands on PROXY_HOST:PORT.
-    "https://raw.githubusercontent.com/httptoolkit/frida-interception-and-unpinning/main/native-connect-hook.js",
+    # reliable defeat of Flutter's own-trust-store TLS. Ordered ahead of every
+    # other fragment so its load-time kickoff and retry timer start earliest
+    # and can never be pre-empted. Decrypts Boursorama (Flutter 3.19) where the
+    # httptoolkit Flutter hook silently missed the function.
+    (_NVISO, "flutter-first"),
+    (f"{_HT}/android/android-certificate-unpinning.js", "core"),
+    (f"{_HT}/android/android-certificate-unpinning-fallback.js", "core"),
+    (f"{_HT}/android/android-disable-flutter-certificate-pinning.js", "flutter"),
+    (f"{_HT}/android/android-disable-root-detection.js", "core"),
+    (f"{_HT}/native-tls-hook.js", "core"),
+    # Rewrites connect() at the libc level so all TCP lands on PROXY_HOST:PORT.
+    # Required for Flutter and any app that ignores the system proxy.
+    (f"{_HT}/native-connect-hook.js", "core"),
 ]
+# Every fragment URL, in canonical order. Used for the DECLAW_BYPASS_URLS-less
+# "include everything" path and as the back-compat default.
+DEFAULT_BYPASS_URLS = [u for u, _ in BYPASS_FRAGMENTS]
 
-# Sentinel checked in the cached bundle. If absent, the cache predates a
-# header addition (URL set OR hardening block) and must be rebuilt even
-# without --refresh. Bump this when you add a new hook to the header so
-# existing caches do not silently lack the new behaviour.
-BYPASS_CACHE_SENTINEL = "ssl_verify_peer_cert"
+
+def select_bypass_urls(frameworks: set[str]) -> list[str]:
+    """Pick bypass fragments for the frameworks detected in this app.
+
+    Core fragments (Java/native TLS, connect redirect, root detection) always
+    apply. Flutter fragments are added only when libflutter is present, so an
+    OkHttp app does not carry the Flutter BoringSSL scanner and a Flutter app
+    gets NVISO first. When frameworks is empty (detection found nothing) every
+    fragment is included, which is the safe superset.
+    """
+    is_flutter = "flutter" in frameworks or not frameworks
+    first = [u for u, c in BYPASS_FRAGMENTS if c == "flutter-first" and is_flutter]
+    core = [u for u, c in BYPASS_FRAGMENTS if c == "core"]
+    flutter = [u for u, c in BYPASS_FRAGMENTS if c == "flutter" and is_flutter]
+    return first + core + flutter
 
 DEFAULT_PROXY_HOST = "127.0.0.1"
 DEFAULT_PROXY_PORT = 8000
@@ -402,6 +422,22 @@ def fetch_frida_gadget(abi: str, *, refresh: bool, version: str = DEFAULT_FRIDA_
     return so
 
 
+def _cache_fragment(url: str, *, refresh: bool) -> str:
+    """Return a bypass fragment's text, caching it per-file under utils/fragments
+    so assembling a per-app bundle never re-downloads and works offline once
+    each fragment has been fetched."""
+    frag_dir = UTILS_DIR / "fragments"
+    frag_dir.mkdir(exist_ok=True)
+    cached = frag_dir / url.rsplit("/", 1)[-1]
+    if cached.exists() and not refresh:
+        return cached.read_text(encoding="utf-8")
+    log.info("Fetching bypass fragment: %s", cached.name)
+    r = requests.get(url, timeout=60)
+    r.raise_for_status()
+    cached.write_text(r.text, encoding="utf-8")
+    return r.text
+
+
 def fetch_bypass_script(
     cert_pem: str,
     *,
@@ -409,46 +445,33 @@ def fetch_bypass_script(
     proxy_host: str,
     proxy_port: int,
     debug_bundle: bool = False,
+    frameworks: Optional[set[str]] = None,
+    dest: Optional[Path] = None,
 ) -> Path:
-    """Assemble the universal bypass JS and return the cached path."""
+    """Assemble a bypass bundle tailored to the detected frameworks.
+
+    DECLAW_BYPASS_URLS overrides selection entirely (all listed URLs, in
+    order). Otherwise select_bypass_urls() picks core hooks plus, only when
+    libflutter is present, the Flutter BoringSSL bypass. Fragments are cached
+    individually; the bundle itself is assembled fresh each call (cheap) so it
+    always reflects the current app, cert, proxy and debug flags.
+    """
     urls_env = os.environ.get("DECLAW_BYPASS_URLS", "").strip()
-    urls = [u for u in urls_env.split(";") if u] if urls_env else list(DEFAULT_BYPASS_URLS)
-    cached = UTILS_DIR / "universal-bypass.js"
+    if urls_env:
+        urls = [u for u in urls_env.split(";") if u]
+    else:
+        urls = select_bypass_urls(frameworks or set())
 
-    stale = (
-        cached.exists()
-        and not urls_env
-        and BYPASS_CACHE_SENTINEL not in cached.read_text(encoding="utf-8", errors="ignore")
-    )
-    if stale:
-        log.info("Cached bypass bundle is missing %s; rebuilding.", BYPASS_CACHE_SENTINEL)
+    chosen = [u.rsplit("/", 1)[-1] for u in urls]
+    log.info("Bypass strategy (%s): %s",
+             ", ".join(sorted(frameworks)) if frameworks else "all",
+             ", ".join(chosen))
 
-    if cached.exists() and not refresh and not stale:
-        log.debug("Using cached %s", cached.name)
-        # Still rewrite the header (CERT_PEM / proxy / DEBUG_MODE may have changed).
-        return _write_bypass(cached, cert_pem, _read_cached_parts(cached),
-                             proxy_host=proxy_host, proxy_port=proxy_port,
-                             debug_bundle=debug_bundle)
-
-    parts: list[tuple[str, str]] = []
-    for url in urls:
-        log.info("Fetching bypass fragment: %s", url.rsplit("/", 1)[-1])
-        r = requests.get(url, timeout=60)
-        r.raise_for_status()
-        parts.append((url, r.text))
-    return _write_bypass(cached, cert_pem, parts,
+    parts = [(url, _cache_fragment(url, refresh=refresh)) for url in urls]
+    out = dest or (UTILS_DIR / "universal-bypass.js")
+    return _write_bypass(out, cert_pem, parts,
                          proxy_host=proxy_host, proxy_port=proxy_port,
                          debug_bundle=debug_bundle)
-
-
-def _read_cached_parts(cached: Path) -> list[tuple[str, str]]:
-    # Strip the previous declaw header so re-writing is idempotent.
-    body = cached.read_text(encoding="utf-8")
-    marker = "// ---- declaw header end ----"
-    idx = body.find(marker)
-    if idx >= 0:
-        body = body[idx + len(marker):].lstrip("\n")
-    return [("(cached)", body)]
 
 
 def _write_bypass(
@@ -1465,7 +1488,15 @@ def install_apks(serial: str, apks: list[Path]) -> None:
 class Tools:
     apktool: Path
     signer: Path
-    bypass_script: Optional[Path]  # None in --minimal mode
+    # Bypass bundle is assembled per app (after framework detection), so Tools
+    # carries the inputs instead of a pre-built path. build_bypass is False in
+    # --minimal mode.
+    build_bypass: bool
+    cert_pem: str = ""
+    proxy_host: str = DEFAULT_PROXY_HOST
+    proxy_port: int = DEFAULT_PROXY_PORT
+    debug_bundle: bool = False
+    refresh: bool = False
     extra_abis: set[str] = field(default_factory=set)
     frida_version: str = DEFAULT_FRIDA_VERSION
 
@@ -1483,14 +1514,18 @@ def prepare_tools(
 ) -> Tools:
     apktool = _cached_jar(APKTOOL_URL, refresh=refresh)
     signer = _cached_jar(UBER_APK_SIGNER_URL, refresh=refresh)
-    bypass = None if minimal else fetch_bypass_script(
-        cert_pem,
-        refresh=refresh,
+    # The bypass bundle is assembled later, per app, once frameworks are known.
+    return Tools(
+        apktool, signer,
+        build_bypass=not minimal,
+        cert_pem=cert_pem,
         proxy_host=proxy_host,
         proxy_port=proxy_port,
         debug_bundle=debug_bundle,
+        refresh=refresh,
+        extra_abis=extra_abis,
+        frida_version=frida_version,
     )
-    return Tools(apktool, signer, bypass, extra_abis, frida_version)
 
 
 def abis_from_apks(apks: list[Path]) -> set[str]:
@@ -1519,6 +1554,39 @@ def abis_from_apks(apks: list[Path]) -> set[str]:
     return abis
 
 
+# Native library name -> framework tag. Used to pick bypass fragments.
+# libapp.so (Dart AOT) and libflutter.so (engine) both appear in release
+# Flutter apps; detecting either (plus the flutter_assets dir) makes Flutter
+# detection hard to miss. Over-detecting Flutter only adds NVISO, which is a
+# no-op when libflutter is absent, so we err toward inclusion.
+_LIB_FRAMEWORK_MARKERS = {
+    "libflutter.so": "flutter",
+    "libapp.so": "flutter",
+    "libreactnativejni.so": "react-native",
+    "libhermes.so": "react-native",
+}
+
+
+def frameworks_from_apks(apks: list[Path]) -> set[str]:
+    """Detect cross-platform frameworks across a split-APK set by their native
+    libs and asset markers. On split bundles these libs live in the per-arch
+    split, not the base, so base-only detection misses them (which left Flutter
+    apps without the NVISO BoringSSL bypass)."""
+    found: set[str] = set()
+    for apk in apks:
+        try:
+            with zipfile.ZipFile(apk) as zf:
+                for name in zf.namelist():
+                    base = name.rsplit("/", 1)[-1]
+                    if base in _LIB_FRAMEWORK_MARKERS:
+                        found.add(_LIB_FRAMEWORK_MARKERS[base])
+                    elif name.startswith("assets/flutter_assets/"):
+                        found.add("flutter")
+        except (zipfile.BadZipFile, OSError):
+            continue
+    return found
+
+
 def patch_base_apk(
     base_apk: Path,
     out_dir: Path,
@@ -1527,13 +1595,18 @@ def patch_base_apk(
     minimal: bool,
     refresh: bool,
     bundle_abis: Optional[set[str]] = None,
+    bundle_frameworks: Optional[set[str]] = None,
 ) -> Path:
     unpacked = out_dir / "base.unpacked"
 
     apktool_decode(base_apk, unpacked, tools.apktool, with_sources=not minimal)
     inspection = inspect_unpacked(unpacked)
-    if inspection.frameworks:
-        log.info("Frameworks detected: %s", ", ".join(sorted(inspection.frameworks)))
+    # Frameworks from the base plus those found in the arch splits (libflutter
+    # lives in split_config.<abi>.apk, not the base, so base-only detection
+    # misses Flutter on split bundles).
+    frameworks = set(inspection.frameworks) | set(bundle_frameworks or set())
+    if frameworks:
+        log.info("Frameworks detected: %s", ", ".join(sorted(frameworks)))
     if inspection.abis:
         log.info("ABIs detected: %s", ", ".join(sorted(inspection.abis)))
 
@@ -1555,11 +1628,23 @@ def patch_base_apk(
         # Static libflutter swap first; if it lands, the Frida hooks below
         # become a backstop instead of the only line of defence.
         try_patch_flutter_static(unpacked, inspection, refresh=refresh)
+        # Assemble the bypass bundle for the frameworks this app actually uses.
+        bypass_script = None
+        if tools.build_bypass:
+            bypass_script = fetch_bypass_script(
+                tools.cert_pem,
+                refresh=tools.refresh,
+                proxy_host=tools.proxy_host,
+                proxy_port=tools.proxy_port,
+                debug_bundle=tools.debug_bundle,
+                frameworks=frameworks,
+                dest=out_dir / "declaw-bypass.js",
+            )
         inject_frida_gadget(
             unpacked,
             inspection,
             manifest_info,
-            bypass_script=tools.bypass_script,
+            bypass_script=bypass_script,
             refresh=refresh,
             extra_abis=extra_abis,
             frida_version=tools.frida_version,
@@ -1688,8 +1773,10 @@ def _run_local_mode(
     log.info("Local mode | base=%s, splits=%d", base_apk.name, len(apks) - 1)
 
     bundle_abis = abis_from_apks(apks)
+    bundle_frameworks = frameworks_from_apks(apks)
     patch_base_apk(base_apk, patched_out, tools,
-                   minimal=minimal, refresh=refresh, bundle_abis=bundle_abis)
+                   minimal=minimal, refresh=refresh,
+                   bundle_abis=bundle_abis, bundle_frameworks=bundle_frameworks)
     sign_splits([a for a in apks if a != base_apk], patched_out, tools.signer)
 
     target_root = (output or PATCHED_DIR).expanduser().resolve()
@@ -1724,9 +1811,11 @@ def _run_adb_mode(
              device.serial, base_apk.name, len(apks) - 1)
 
     bundle_abis = abis_from_apks(apks)
+    bundle_frameworks = frameworks_from_apks(apks)
     final_base = patch_base_apk(base_apk, patched_out, tools,
                                 minimal=minimal, refresh=refresh,
-                                bundle_abis=bundle_abis)
+                                bundle_abis=bundle_abis,
+                                bundle_frameworks=bundle_frameworks)
     final_splits = sign_splits(
         [a for a in apks if a != base_apk], patched_out, tools.signer
     )
