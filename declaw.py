@@ -1485,6 +1485,32 @@ def prepare_tools(
     return Tools(apktool, signer, bypass, extra_abis, frida_version)
 
 
+def abis_from_apks(apks: list[Path]) -> set[str]:
+    """Union of native ABIs across a split-APK set.
+
+    A split-bundle base.apk carries no lib/ dir (native libs live in the
+    per-arch split_config.<abi>.apk). So ABI detection that only reads the
+    base sees nothing and the gadget defaults to arm64-v8a, leaving every
+    other arch split without lib<name>.so. Installing the x86_64 split then
+    dies at System.loadLibrary with UnsatisfiedLinkError. Scanning every
+    apk's lib/<abi>/ entries recovers the real ABI set so the gadget gets
+    injected into the base for each arch the bundle ships.
+    """
+    abis: set[str] = set()
+    known = set(FRIDA_ABI_MAP.keys())
+    for apk in apks:
+        try:
+            with zipfile.ZipFile(apk) as zf:
+                for name in zf.namelist():
+                    if name.startswith("lib/"):
+                        parts = name.split("/")
+                        if len(parts) >= 3 and parts[1] in known:
+                            abis.add(parts[1])
+        except (zipfile.BadZipFile, OSError):
+            continue
+    return abis
+
+
 def patch_base_apk(
     base_apk: Path,
     out_dir: Path,
@@ -1492,6 +1518,7 @@ def patch_base_apk(
     *,
     minimal: bool,
     refresh: bool,
+    bundle_abis: Optional[set[str]] = None,
 ) -> Path:
     unpacked = out_dir / "base.unpacked"
 
@@ -1501,6 +1528,16 @@ def patch_base_apk(
         log.info("Frameworks detected: %s", ", ".join(sorted(inspection.frameworks)))
     if inspection.abis:
         log.info("ABIs detected: %s", ", ".join(sorted(inspection.abis)))
+
+    # ABIs the gadget must cover: those in the base plus those carried by the
+    # sibling arch splits, plus any caller-requested extras. Whatever split
+    # the user ends up installing, the base will carry the matching gadget.
+    extra_abis = set(tools.extra_abis)
+    if bundle_abis:
+        split_only = bundle_abis - set(inspection.abis)
+        if split_only:
+            log.info("ABIs from arch splits: %s", ", ".join(sorted(split_only)))
+        extra_abis |= bundle_abis
 
     manifest_info = patch_manifest(unpacked)
     add_network_security_config(unpacked)
@@ -1516,7 +1553,7 @@ def patch_base_apk(
             manifest_info,
             bypass_script=tools.bypass_script,
             refresh=refresh,
-            extra_abis=tools.extra_abis,
+            extra_abis=extra_abis,
             frida_version=tools.frida_version,
         )
 
@@ -1642,8 +1679,9 @@ def _run_local_mode(
     base_apk = identify_base_apk(apks)
     log.info("Local mode | base=%s, splits=%d", base_apk.name, len(apks) - 1)
 
+    bundle_abis = abis_from_apks(apks)
     patch_base_apk(base_apk, patched_out, tools,
-                   minimal=minimal, refresh=refresh)
+                   minimal=minimal, refresh=refresh, bundle_abis=bundle_abis)
     sign_splits([a for a in apks if a != base_apk], patched_out, tools.signer)
 
     target_root = (output or PATCHED_DIR).expanduser().resolve()
@@ -1677,8 +1715,10 @@ def _run_adb_mode(
     log.info("ADB mode | device=%s, base=%s, splits=%d",
              device.serial, base_apk.name, len(apks) - 1)
 
+    bundle_abis = abis_from_apks(apks)
     final_base = patch_base_apk(base_apk, patched_out, tools,
-                                minimal=minimal, refresh=refresh)
+                                minimal=minimal, refresh=refresh,
+                                bundle_abis=bundle_abis)
     final_splits = sign_splits(
         [a for a in apks if a != base_apk], patched_out, tools.signer
     )
