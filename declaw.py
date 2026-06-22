@@ -783,9 +783,14 @@ def fetch_bypass_script(
 
     parts = [(url, _cache_fragment(url, refresh=refresh)) for url in urls]
     out = dest or (UTILS_DIR / "universal-bypass.js")
+    # The Java hardening hooks (NetCap/WebView/anti-debug) instrument ART methods,
+    # which intermittently crash the concurrent mark-compact GC on Android 16+.
+    # On the native_only (Frida 17.x) path skip them; the core unpinning is all
+    # native and GC-safe. They stay on the 16.x path (old ART tolerates them).
     return _write_bypass(out, cert_pem, parts,
                          proxy_host=proxy_host, proxy_port=proxy_port,
-                         debug_bundle=debug_bundle)
+                         debug_bundle=debug_bundle,
+                         java_hardening=not native_only)
 
 
 def _write_bypass(
@@ -796,8 +801,10 @@ def _write_bypass(
     proxy_host: str,
     proxy_port: int,
     debug_bundle: bool = False,
+    java_hardening: bool = True,
 ) -> Path:
-    header = _bypass_header(cert_pem, proxy_host, proxy_port, debug_bundle)
+    header = _bypass_header(cert_pem, proxy_host, proxy_port, debug_bundle,
+                            java_hardening=java_hardening)
     with open(cached, "w", encoding="utf-8") as fh:
         fh.write(header)
         for url, body in parts:
@@ -889,7 +896,7 @@ def frida_compile_bundle(bundle: Path) -> Optional[Path]:
 
 
 def _bypass_header(cert_pem: str, proxy_host: str, proxy_port: int,
-                   debug_bundle: bool = False) -> str:
+                   debug_bundle: bool = False, java_hardening: bool = True) -> str:
     escaped_pem = cert_pem.strip()
     debug_flag = "true" if debug_bundle else "false"
     # When debug_bundle is on, route every console.log through android.util.Log
@@ -1000,7 +1007,7 @@ def _bypass_header(cert_pem: str, proxy_host: str, proxy_port: int,
         "const BLOCK_HTTP3 = true;\n"
         "const PROXY_SUPPORTS_SOCKS5 = false;\n"
         f"{debug_block}"
-        f"{hardening_block}"
+        f"{hardening_block if java_hardening else ''}"
         "// ---- declaw header end ----\n"
     )
 
