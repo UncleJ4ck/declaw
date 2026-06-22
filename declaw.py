@@ -40,7 +40,9 @@ import lzma
 import os
 import re
 import shutil
+import struct
 import subprocess as sp
+import zlib
 import sys
 import uuid
 import zipfile
@@ -81,11 +83,23 @@ BUNDLETOOL_URL = "https://api.github.com/repos/google/bundletool/releases/latest
 #   https://github.com/frida/frida/issues/3526
 #   https://github.com/frida/frida/issues/3645
 # Symptom: console.log / Java.perform / setImmediate all silently no-op.
-# Root cause: an ART change in late 2024 that the 17.x gadget runtime hasn't
-# adapted to. 16.7.19 (May 2025) is the last release where script mode works.
-# We pin to that until upstream ships a real fix. Override with --frida-version
-# or DECLAW_FRIDA_VERSION when a known-good 17.x lands.
-DEFAULT_FRIDA_VERSION = "16.7.19"
+# Frida 16.7.19's Gum SIGSEGVs on Android 16+ the instant any hook executes
+# (incompatible with the new ART/loader), so it is useless on current phones.
+# Frida 17.x's Gum works there, but its gadget refuses to run a raw concatenated
+# script (the language bridges were unbundled). The fix: ship the 17.x gadget and
+# run the bundle through frida-compile (see _frida_compile), which inlines a shim
+# providing the `Java` global + the moved Module APIs. That combination is the
+# only one that works on EVERY Android. If node/frida-compile is unavailable we
+# fall back to the 16.x gadget + raw bundle (fine for Android <= 15 only).
+DEFAULT_FRIDA_VERSION = "17.15.2"
+FALLBACK_FRIDA_VERSION = "16.7.19"  # used when frida-compile cannot run (no node)
+
+
+def _frida_major(version: str) -> int:
+    try:
+        return int(version.lstrip("v").split(".")[0])
+    except (ValueError, IndexError):
+        return 0
 FRIDA_RELEASES_TAG_URL = "https://api.github.com/repos/frida/frida/releases/tags/{tag}"
 FRIDA_RELEASES_LATEST_URL = "https://api.github.com/repos/frida/frida/releases/latest"
 
@@ -95,31 +109,39 @@ FRIDA_RELEASES_LATEST_URL = "https://api.github.com/repos/frida/frida/releases/l
 #   "flutter-first" : Flutter BoringSSL bypass, must run before anything else
 #   "core"          : Java/native TLS hooks that apply to almost any Android app
 #   "flutter"       : extra Flutter hooks, only useful when libflutter is present
+# The third field is the hook ENGINE:
+#   "native" : pure Gum hooks (libc/BoringSSL/libflutter). GC-safe on every
+#              Android, including 16+ under the 17.x gadget.
+#   "java"   : instruments ART Java methods via frida-java-bridge. Crashes ART's
+#              Concurrent Mark Compact GC on Android 16+ (frida-java-bridge#387),
+#              so it is excluded unless explicitly requested or targeting old ART.
 _NVISO = "https://raw.githubusercontent.com/NVISOsecurity/disable-flutter-tls-verification/main/disable-flutter-tls.js"
 _HT = "https://raw.githubusercontent.com/httptoolkit/frida-interception-and-unpinning/main"
 BYPASS_FRAGMENTS = [
     # NVISO Flutter TLS bypass FIRST. It pattern-locates ssl_verify_peer_cert
     # in libflutter's BoringSSL and patches it to return success, the only
-    # reliable defeat of Flutter's own-trust-store TLS. Ordered ahead of every
-    # other fragment so its load-time kickoff and retry timer start earliest
-    # and can never be pre-empted. Decrypts Boursorama (Flutter 3.19) where the
-    # httptoolkit Flutter hook silently missed the function.
-    (_NVISO, "flutter-first"),
-    (f"{_HT}/android/android-certificate-unpinning.js", "core"),
-    (f"{_HT}/android/android-certificate-unpinning-fallback.js", "core"),
-    (f"{_HT}/android/android-disable-flutter-certificate-pinning.js", "flutter"),
-    (f"{_HT}/android/android-disable-root-detection.js", "core"),
-    (f"{_HT}/native-tls-hook.js", "core"),
+    # reliable defeat of Flutter's own-trust-store TLS. Native, GC-safe.
+    (_NVISO, "flutter-first", "native"),
+    (f"{_HT}/android/android-certificate-unpinning.js", "core", "java"),
+    (f"{_HT}/android/android-certificate-unpinning-fallback.js", "core", "java"),
+    # NB: httptoolkit's android-disable-flutter-certificate-pinning.js is omitted
+    # on purpose: NVISO + the static libflutter patch already cover Flutter, and
+    # it throws "multiple matches for CertificateCallback" on current engines.
+    (f"{_HT}/android/android-disable-root-detection.js", "core", "java"),
+    # Hooks Conscrypt/BoringSSL native verify -> defeats system-trust + native
+    # pinning without touching Java. Covers most OkHttp apps (OkHttp uses
+    # Conscrypt). Native, GC-safe.
+    (f"{_HT}/native-tls-hook.js", "core", "native"),
     # Rewrites connect() at the libc level so all TCP lands on PROXY_HOST:PORT.
-    # Required for Flutter and any app that ignores the system proxy.
-    (f"{_HT}/native-connect-hook.js", "core"),
+    # Required for Flutter and any app that ignores the system proxy. Native.
+    (f"{_HT}/native-connect-hook.js", "core", "native"),
 ]
 # Every fragment URL, in canonical order. Used for the DECLAW_BYPASS_URLS-less
 # "include everything" path and as the back-compat default.
-DEFAULT_BYPASS_URLS = [u for u, _ in BYPASS_FRAGMENTS]
+DEFAULT_BYPASS_URLS = [u for u, _, _ in BYPASS_FRAGMENTS]
 
 
-def select_bypass_urls(frameworks: set[str]) -> list[str]:
+def select_bypass_urls(frameworks: set[str], *, native_only: bool = False) -> list[str]:
     """Pick bypass fragments for the frameworks detected in this app.
 
     Core fragments (Java/native TLS, connect redirect, root detection) always
@@ -127,11 +149,18 @@ def select_bypass_urls(frameworks: set[str]) -> list[str]:
     OkHttp app does not carry the Flutter BoringSSL scanner and a Flutter app
     gets NVISO first. When frameworks is empty (detection found nothing) every
     fragment is included, which is the safe superset.
+
+    native_only drops the "java" (ART-instrumenting) fragments, which crash the
+    GC on Android 16+. Used with the Frida 17.x gadget so the bundle works on
+    every Android; the dropped Java pinning is covered statically by the NSC
+    patch (and natively by native-tls-hook for Conscrypt/OkHttp).
     """
+    def keep(engine: str) -> bool:
+        return engine == "native" or not native_only
     is_flutter = "flutter" in frameworks or not frameworks
-    first = [u for u, c in BYPASS_FRAGMENTS if c == "flutter-first" and is_flutter]
-    core = [u for u, c in BYPASS_FRAGMENTS if c == "core"]
-    flutter = [u for u, c in BYPASS_FRAGMENTS if c == "flutter" and is_flutter]
+    first = [u for u, c, e in BYPASS_FRAGMENTS if c == "flutter-first" and is_flutter and keep(e)]
+    core = [u for u, c, e in BYPASS_FRAGMENTS if c == "core" and keep(e)]
+    flutter = [u for u, c, e in BYPASS_FRAGMENTS if c == "flutter" and is_flutter and keep(e)]
     return first + core + flutter
 
 DEFAULT_PROXY_HOST = "127.0.0.1"
@@ -422,6 +451,269 @@ def fetch_frida_gadget(abi: str, *, refresh: bool, version: str = DEFAULT_FRIDA_
     return so
 
 
+# Android 15+ on a 16 KB-page device (Pixel 8/9, current AOSP, many 2024+ phones)
+# refuses to correctly map a .so whose LOAD segments are 4 KB-aligned. The Frida
+# gadget ships 4 KB-aligned for every version (verified 16.7.19 and 17.x), so on
+# such a device its segments land on the wrong pages and the first hook the
+# script installs jumps through a corrupt trampoline -> SIGSEGV. Re-aligning the
+# gadget's LOAD segments to 16 KB fixes it; 16 KB is a superset of 4 KB so the
+# result still loads on every older 4 KB-page device. This is additive: it only
+# touches the injected gadget, never the app's own libs (already 16 KB-aligned).
+GADGET_PAGE_ALIGN = 0x4000  # 16 KB
+
+
+def _align_native_lib_16k(src: Path, dst: Path) -> bool:
+    """Copy src -> dst, re-aligning ELF64 LOAD segments to 16 KB when needed.
+
+    Returns True if a re-align was applied, False if the lib was already
+    >= 16 KB-aligned and copied verbatim. Inserts the minimum zero padding
+    before each under-aligned LOAD segment so its file offset satisfies the
+    loader's congruence rule (p_offset % page == p_vaddr % page), bumps
+    p_align to 16 KB, shifts every program-header offset to track the inserted
+    padding, and grows the file accordingly. Section headers (loader-irrelevant)
+    are dropped so their now-stale offsets cannot trip a strict linker.
+
+    Pure stdlib (struct) on purpose: lief 0.17 silently fails to relocate this
+    gadget's bss-bearing trailing segment, producing a "p_offset past end of
+    file" image that the Android linker rejects.
+    """
+    data = bytearray(src.read_bytes())
+    # ELF64 little-endian only (every Android gadget ABI we ship). Anything
+    # else: copy verbatim rather than risk a bad rewrite.
+    if data[:4] != b"\x7fELF" or len(data) < 64 or data[4] != 2 or data[5] != 1:
+        shutil.copy2(src, dst)
+        return False
+    en = "<"
+    PAGE = GADGET_PAGE_ALIGN
+    PT_LOAD = 1
+    (e_phoff,) = struct.unpack_from(en + "Q", data, 0x20)
+    (e_shoff,) = struct.unpack_from(en + "Q", data, 0x28)
+    (e_phentsize,) = struct.unpack_from(en + "H", data, 0x36)
+    (e_phnum,) = struct.unpack_from(en + "H", data, 0x38)
+    (e_shentsize,) = struct.unpack_from(en + "H", data, 0x3A)
+    (e_shnum,) = struct.unpack_from(en + "H", data, 0x3C)
+
+    phdrs = []  # (hdr_offset, p_type, p_offset, p_vaddr, p_align)
+    for i in range(e_phnum):
+        base = e_phoff + i * e_phentsize
+        p_type = struct.unpack_from(en + "I", data, base)[0]
+        p_offset, p_vaddr = struct.unpack_from(en + "QQ", data, base + 8)
+        p_align = struct.unpack_from(en + "Q", data, base + 48)[0]
+        phdrs.append((base, p_type, p_offset, p_vaddr, p_align))
+
+    loads = [p for p in phdrs if p[1] == PT_LOAD]
+    if not loads or all(p[4] >= PAGE for p in loads):
+        shutil.copy2(src, dst)
+        return False
+
+    # Walk LOAD segments in file order, inserting just enough padding before
+    # each so its new offset is page-congruent with its vaddr.
+    inserts = []  # (at_old_offset, pad_bytes)
+    cum = 0
+    for _, _, p_offset, p_vaddr, _ in sorted(loads, key=lambda p: p[2]):
+        need = (p_vaddr - (p_offset + cum)) % PAGE
+        cum += need
+        inserts.append((p_offset, need))
+
+    def shift_for(off: int) -> int:
+        return sum(pad for at, pad in inserts if at <= off)
+
+    # Rebuild the file with the padding spliced in.
+    out = bytearray()
+    pos = 0
+    for at, pad in sorted(inserts, key=lambda x: x[0]):
+        out += data[pos:at]
+        out += b"\x00" * pad
+        pos = at
+    out += data[pos:]
+
+    # Fix up every program-header offset; bump LOAD alignment to the page size.
+    for base, p_type, p_offset, _p_vaddr, _p_align in phdrs:
+        struct.pack_into(en + "Q", out, base + 8, p_offset + shift_for(p_offset))
+        if p_type == PT_LOAD:
+            struct.pack_into(en + "Q", out, base + 48, PAGE)
+    # Shift e_phoff if it moved.
+    struct.pack_into(en + "Q", out, 0x20, e_phoff + shift_for(e_phoff))
+    # Keep the section header table but track the padding: the Android linker
+    # validates e_shstrndx, so the table must stay present and consistent
+    # (zeroing it trips "invalid e_shstrndx"). Shift e_shoff and every section
+    # offset by the padding inserted before them.
+    if e_shoff and e_shnum:
+        struct.pack_into(en + "Q", out, 0x28, e_shoff + shift_for(e_shoff))
+        for i in range(e_shnum):
+            old_sh = e_shoff + i * e_shentsize
+            new_sh = old_sh + shift_for(old_sh)
+            sh_offset = struct.unpack_from(en + "Q", data, old_sh + 24)[0]
+            if sh_offset:
+                struct.pack_into(en + "Q", out, new_sh + 24,
+                                 sh_offset + shift_for(sh_offset))
+
+    dst.write_bytes(out)
+    return True
+
+
+# --------------------------------------------------------------------------- #
+#  Static Flutter TLS bypass (no gadget, no Frida)                            #
+# --------------------------------------------------------------------------- #
+#
+# Flutter ships its own BoringSSL inside libflutter.so and verifies the server
+# cert against a baked-in trust store, ignoring the system store, the NSC, and
+# any user CA. The only reliable defeat is to neuter ssl_verify_peer_cert (and
+# the session_verify_cert_chain helper) so it always reports success. The NVISO
+# runtime hook does this with Frida, but the gadget's Interceptor SIGSEGVs on
+# some new arm64 SoCs (Pixel 8 / Tensor G3, Android 16) and Frida 17's gadget
+# won't run scripts at all. So we also do it STATICALLY at patch time: locate
+# the function by NVISO's byte signatures and overwrite its prologue with a stub
+# that returns the success value. No runtime, no Frida, device-independent.
+#
+# These signatures are ported verbatim from NVISO's disable-flutter-tls.js
+# (the Android "libflutter.so" config). ssl_verify_peer_cert returns an
+# enum ssl_verify_result_t where ssl_verify_ok == 0; that return convention has
+# been stable across BoringSSL/Flutter versions for years, which is why the stub
+# value lives with each signature (retval) rather than being guessed. Update
+# this table from upstream when a new Flutter engine ships an unmatched layout:
+#   https://github.com/NVISOsecurity/disable-flutter-tls-verification
+FLUTTER_TLS_SIGS: dict[str, list[tuple[str, int]]] = {
+    "arm64": [
+        ("F? 0F 1C F8 F? 5? 01 A9 F? 5? 02 A9 F? ?? 03 A9 ?? ?? ?? ?? 68 1A 40 F9", 0),
+        ("F? 43 01 D1 FE 67 01 A9 F8 5F 02 A9 F6 57 03 A9 F4 4F 04 A9 13 00 40 F9 "
+         "F4 03 00 AA 68 1A 40 F9", 0),
+        ("FF 43 01 D1 FE 67 01 A9 ?? ?? 06 94 ?? 7? 06 94 68 1A 40 F9 15 15 41 F9 "
+         "B5 00 00 B4 B6 4A 40 F9", 0),
+        ("FF ?3 01 D1 F? ?? 01 A9 ?? ?? ?? 94 ?? ?? ?? 52 48 00 00 39 1A 50 40 F9 "
+         "DA 02 00 B4 48 03 40 F9", 1),
+    ],
+    "arm": [
+        ("2D E9 F? 4? D0 F8 00 80 81 46 D8 F8 18 00 D0 F8", 0),
+    ],
+    "x86_64": [
+        ("55 41 57 41 56 41 55 41 54 53 50 49 89 F? 4? 8B ?? 4? 8B 4? 30 4C 8B ?? "
+         "?? 0? 00 00 4D 85 ?? 74 1? 4D 8B", 0),
+        ("55 41 57 41 56 41 55 41 54 53 48 83 EC 18 49 89 FF 48 8B 1F 48 8B 43 30 "
+         "4C 8B A0 28 02 00 00 4D 85 E4 74", 0),
+        ("55 41 57 41 56 41 55 41 54 53 48 83 EC 18 49 89 FE 4C 8B 27 49 8B 44 24 "
+         "30 48 8B 98 D0 01 00 00 48 85 DB", 0),
+    ],
+    "x86": [
+        ("55 89 E5 53 57 56 83 E4 F0 83 EC 20 E8 00 00 00 00 5B 81 C3 2B 79 66 00 "
+         "8B 7D 08 8B 17 8B 42 18 8B 80 88 01", 0),
+    ],
+}
+
+# APK lib/<abi>/ directory name -> instruction-set key in FLUTTER_TLS_SIGS.
+_ABI_TO_ARCH = {
+    "arm64-v8a": "arm64",
+    "armeabi-v7a": "arm",
+    "armeabi": "arm",
+    "x86_64": "x86_64",
+    "x86": "x86",
+}
+
+
+def _flutter_return_stub(arch: str, retval: int) -> bytes:
+    """Machine code that does `return retval;` for the given instruction set."""
+    if arch == "arm64":
+        return struct.pack("<II", 0x52800000 | ((retval & 0xFFFF) << 5), 0xD65F03C0)
+    if arch == "arm":  # Thumb: movs r0, #retval ; bx lr
+        return struct.pack("<HH", 0x2000 | (retval & 0xFF), 0x4770)
+    if arch in ("x86_64", "x86"):  # mov eax, retval ; ret
+        return b"\xb8" + struct.pack("<I", retval & 0xFFFFFFFF) + b"\xc3"
+    raise ValueError(f"no return stub for arch {arch}")
+
+
+def _sig_to_regex(sig: str) -> "re.Pattern[bytes]":
+    """Compile an NVISO-style nibble-wildcard signature to a bytes regex."""
+    out = b""
+    for tok in sig.split():
+        hi, lo = tok[0], tok[1]
+        if hi == "?" and lo == "?":
+            out += b"."
+        elif hi != "?" and lo != "?":
+            out += re.escape(bytes([int(tok, 16)]))
+        else:
+            vals = [b for b in range(256)
+                    if (hi == "?" or f"{b:02X}"[0] == hi.upper())
+                    and (lo == "?" or f"{b:02X}"[1] == lo.upper())]
+            out += b"[" + b"".join(re.escape(bytes([v])) for v in vals) + b"]"
+    return re.compile(out, re.DOTALL)
+
+
+def _patch_flutter_tls_bytes(data: bytes, arch: str) -> tuple[bytes, list[int]]:
+    """Return (patched_data, [offsets]) with every ssl_verify_peer_cert match in
+    `data` overwritten by a success-returning stub for `arch`. No-op (empty list)
+    when no signature matches, so it is safe on non-Flutter libs and idempotent
+    (a patched prologue no longer matches)."""
+    sigs = FLUTTER_TLS_SIGS.get(arch)
+    if not sigs:
+        return data, []
+    buf = bytearray(data)
+    hits: list[int] = []
+    for sig, retval in sigs:
+        stub = _flutter_return_stub(arch, retval)
+        for m in _sig_to_regex(sig).finditer(data):
+            off = m.start()
+            if off in hits:
+                continue
+            buf[off:off + len(stub)] = stub
+            hits.append(off)
+    return bytes(buf), sorted(hits)
+
+
+def _static_patch_flutter_so(apk: Path) -> int:
+    """Patch any Stored lib/<abi>/libflutter.so inside `apk` in place so its
+    TLS verification always succeeds, fixing the entry CRC and re-writing the
+    APK bytes. Returns the number of call sites patched across all ABIs. Leaves
+    every other zip entry (resources.arsc, alignment, the manifest) untouched,
+    so the existing sign step's zipalign still holds. Deflated libflutter.so is
+    reported and skipped (rare; would need a full re-zip)."""
+    raw = bytearray(apk.read_bytes())
+    eocd = raw.rfind(b"PK\x05\x06")
+    if eocd < 0:
+        return 0
+    cd_off = struct.unpack_from("<I", raw, eocd + 16)[0]
+    cd_count = struct.unpack_from("<H", raw, eocd + 10)[0]
+    total = 0
+    p = cd_off
+    for _ in range(cd_count):
+        if raw[p:p + 4] != b"PK\x01\x02":
+            break
+        method = struct.unpack_from("<H", raw, p + 10)[0]
+        comp_size = struct.unpack_from("<I", raw, p + 20)[0]
+        name_len = struct.unpack_from("<H", raw, p + 28)[0]
+        extra_len = struct.unpack_from("<H", raw, p + 30)[0]
+        comment_len = struct.unpack_from("<H", raw, p + 32)[0]
+        lh_off = struct.unpack_from("<I", raw, p + 42)[0]
+        name = raw[p + 46:p + 46 + name_len].decode("utf-8", "replace")
+        m = re.fullmatch(r"lib/([^/]+)/libflutter\.so", name)
+        if m:
+            arch = _ABI_TO_ARCH.get(m.group(1))
+            if arch is None:
+                pass
+            elif method != 0:
+                log.warning("libflutter.so in %s is compressed; static TLS "
+                            "patch skipped for %s", apk.name, name)
+            else:
+                # Local header: 30 + name_len + extra_len -> entry data.
+                lname_len = struct.unpack_from("<H", raw, lh_off + 26)[0]
+                lextra_len = struct.unpack_from("<H", raw, lh_off + 28)[0]
+                data_off = lh_off + 30 + lname_len + lextra_len
+                blob = bytes(raw[data_off:data_off + comp_size])
+                patched, hits = _patch_flutter_tls_bytes(blob, arch)
+                if hits:
+                    raw[data_off:data_off + comp_size] = patched
+                    crc = zlib.crc32(patched) & 0xFFFFFFFF
+                    struct.pack_into("<I", raw, p + 16, crc)        # central dir
+                    struct.pack_into("<I", raw, lh_off + 14, crc)   # local header
+                    total += len(hits)
+                    log.info("Static Flutter TLS patch: %s %s -> %d site(s) at %s",
+                             apk.name, name, len(hits),
+                             ", ".join(hex(h) for h in hits))
+        p += 46 + name_len + extra_len + comment_len
+    if total:
+        apk.write_bytes(raw)
+    return total
+
+
 def _cache_fragment(url: str, *, refresh: bool) -> str:
     """Return a bypass fragment's text, caching it per-file under utils/fragments
     so assembling a per-app bundle never re-downloads and works offline once
@@ -447,6 +739,7 @@ def fetch_bypass_script(
     debug_bundle: bool = False,
     frameworks: Optional[set[str]] = None,
     dest: Optional[Path] = None,
+    native_only: bool = False,
 ) -> Path:
     """Assemble a bypass bundle tailored to the detected frameworks.
 
@@ -455,12 +748,15 @@ def fetch_bypass_script(
     libflutter is present, the Flutter BoringSSL bypass. Fragments are cached
     individually; the bundle itself is assembled fresh each call (cheap) so it
     always reflects the current app, cert, proxy and debug flags.
+
+    native_only drops ART-instrumenting (Java) fragments for the Frida 17.x
+    gadget so the bundle stays GC-safe on Android 16+.
     """
     urls_env = os.environ.get("DECLAW_BYPASS_URLS", "").strip()
     if urls_env:
         urls = [u for u in urls_env.split(";") if u]
     else:
-        urls = select_bypass_urls(frameworks or set())
+        urls = select_bypass_urls(frameworks or set(), native_only=native_only)
 
     chosen = [u.rsplit("/", 1)[-1] for u in urls]
     log.info("Bypass strategy (%s): %s",
@@ -492,6 +788,86 @@ def _write_bypass(
             if not body.endswith("\n"):
                 fh.write("\n")
     return cached
+
+
+# --------------------------------------------------------------------------- #
+#  Frida 17.x: compile the bundle so the gadget can run it on every Android    #
+# --------------------------------------------------------------------------- #
+#
+# The 17.x gadget will not run a raw concatenated 16.x-style script: the language
+# bridges were unbundled and several Module APIs moved. frida-compile bundles a
+# shim that restores the `Java` global (from frida-java-bridge) and the moved
+# Module APIs, plus a waitForModule polyfill, so the existing fragments run
+# unchanged. Validated on Android 16/17 (Cuttlefish arm64): native fragments
+# load and patch ssl_verify_peer_cert with the process staying alive.
+_FC_SHIM = (
+    "import Java from 'frida-java-bridge';\n"
+    "globalThis.Java = Java;\n"
+    "const P = Process;\n"
+    "if (!Module.getExportByName) Module.getExportByName = (m, s) => m === null"
+    " ? Module.getGlobalExportByName(s)"
+    " : (P.findModuleByName(m)?.getExportByName(s) ?? null);\n"
+    "if (!Module.findExportByName) Module.findExportByName = (m, s) => { try {"
+    " return m === null ? (Module.getGlobalExportByName?.(s) ?? null)"
+    " : (P.findModuleByName(m)?.findExportByName(s) ?? null); } catch (e) { return null; } };\n"
+    "globalThis.waitForModule = function (name, cb) { const hit = P.findModuleByName(name);"
+    " if (hit) { cb(hit); return; }"
+    " const iv = setInterval(() => { const m = P.findModuleByName(name);"
+    " if (m) { clearInterval(iv); cb(m); } }, 500); };\n"
+)
+
+
+def have_frida_compile() -> bool:
+    return shutil.which("npx") is not None and shutil.which("node") is not None
+
+
+def _ensure_fc_project(*, refresh: bool = False) -> Path:
+    """Create (once) and return the cached frida-compile project under utils/fc."""
+    fc = UTILS_DIR / "fc"
+    installed = fc / "node_modules" / "frida-compile"
+    (fc / "shim.js").parent.mkdir(parents=True, exist_ok=True)
+    (fc / "package.json").write_text(
+        '{"name":"declaw-fc","version":"1.0.0","type":"module","private":true}\n',
+        encoding="utf-8")
+    (fc / "shim.js").write_text(_FC_SHIM, encoding="utf-8")
+    (fc / "entry.js").write_text("import './shim.js';\nimport './declaw-bundle.js';\n",
+                                 encoding="utf-8")
+    if installed.exists() and not refresh:
+        return fc
+    log.info("Installing frida-compile + frida-java-bridge (one-time) ...")
+    sp.run(["npm", "i", "--silent", "frida-compile@19", "frida-java-bridge@7"],
+           cwd=fc, check=True)
+    return fc
+
+
+def frida_compile_bundle(bundle: Path) -> Optional[Path]:
+    """Compile the raw bundle into a single script the Frida 17.x gadget runs.
+
+    Returns the compiled .js path, or None if frida-compile is unavailable so the
+    caller can fall back to the 16.x gadget + raw bundle.
+    """
+    if not have_frida_compile():
+        log.warning("node/npx not found: cannot frida-compile for the 17.x gadget. "
+                    "Falling back to Frida %s (works on Android <= 15 only). "
+                    "Install Node.js for Android 16+ support.", FALLBACK_FRIDA_VERSION)
+        return None
+    try:
+        fc = _ensure_fc_project()
+        shutil.copy2(bundle, fc / "declaw-bundle.js")
+        out = fc / "compiled.js"
+        if out.exists():
+            out.unlink()
+        sp.run(["npx", "--yes", "frida-compile", "entry.js", "-o", str(out)],
+               cwd=fc, check=True)
+        if not out.exists():
+            raise RuntimeError("frida-compile produced no output")
+        log.info("frida-compiled bundle for the 17.x gadget (%d KB)",
+                 out.stat().st_size // 1024)
+        return out
+    except Exception as exc:  # noqa: BLE001 - any failure -> fall back gracefully
+        log.warning("frida-compile failed (%s). Falling back to Frida %s.",
+                    exc, FALLBACK_FRIDA_VERSION)
+        return None
 
 
 def _bypass_header(cert_pem: str, proxy_host: str, proxy_port: int,
@@ -1002,10 +1378,13 @@ def inject_frida_gadget(
         gadget_so = fetch_frida_gadget(abi, refresh=refresh, version=frida_version)
         abi_dir = lib_root / abi
         abi_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(gadget_so, abi_dir / gadget_file)
+        realigned = _align_native_lib_16k(gadget_so, abi_dir / gadget_file)
         (abi_dir / config_file).write_bytes(config_bytes)
         shutil.copy2(bypass_script, abi_dir / script_file)
-        log.info("Gadget + unpin script placed in lib/%s/ as %s", abi, gadget_file)
+        log.info(
+            "Gadget + unpin script placed in lib/%s/ as %s%s",
+            abi, gadget_file, " (re-aligned to 16 KB pages)" if realigned else "",
+        )
 
     target_class = manifest.application_class or manifest.launcher_activity
     loaded = False
@@ -1629,6 +2008,11 @@ def patch_base_apk(
         # become a backstop instead of the only line of defence.
         try_patch_flutter_static(unpacked, inspection, refresh=refresh)
         # Assemble the bypass bundle for the frameworks this app actually uses.
+        # On Frida 17.x (the default, works on every Android) the bundle is
+        # native-only and run through frida-compile; if compile is unavailable we
+        # downgrade the gadget to 16.x + the raw bundle (Android <= 15 only).
+        eff_frida = tools.frida_version
+        want_v17 = _frida_major(eff_frida) >= 17
         bypass_script = None
         if tools.build_bypass:
             bypass_script = fetch_bypass_script(
@@ -1639,7 +2023,14 @@ def patch_base_apk(
                 debug_bundle=tools.debug_bundle,
                 frameworks=frameworks,
                 dest=out_dir / "declaw-bypass.js",
+                native_only=want_v17,
             )
+            if want_v17:
+                compiled = frida_compile_bundle(bypass_script)
+                if compiled is not None:
+                    bypass_script = compiled
+                else:
+                    eff_frida = FALLBACK_FRIDA_VERSION
         inject_frida_gadget(
             unpacked,
             inspection,
@@ -1647,11 +2038,15 @@ def patch_base_apk(
             bypass_script=bypass_script,
             refresh=refresh,
             extra_abis=extra_abis,
-            frida_version=tools.frida_version,
+            frida_version=eff_frida,
         )
 
     repacked = out_dir / "base.repack.apk"
     apktool_build(unpacked, repacked, tools.apktool)
+    # Static Flutter TLS defeat for any libflutter.so carried in the base. Runs
+    # in addition to the runtime NVISO hook so the bypass survives even where the
+    # Frida gadget can't (e.g. 16 KB-page / new-SoC devices). No-op if not Flutter.
+    _static_patch_flutter_so(repacked)
     sign_apk(repacked, tools.signer)
 
     final_base = out_dir / f"{base_apk.stem}_patched.apk"
@@ -1668,6 +2063,8 @@ def sign_splits(splits: list[Path], out_dir: Path, signer_jar: Path) -> list[Pat
     for s in splits:
         tmp = out_dir / f"{s.stem}.split.apk"
         shutil.copy2(s, tmp)
+        # Flutter's libflutter.so usually rides in the arch split, not the base.
+        _static_patch_flutter_so(tmp)
         tmps.append(tmp)
 
     errors: list[BaseException] = []
@@ -1927,15 +2324,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         log.info("DEBUG_MODE enabled in bundled script. Tail `adb logcat -s declaw:V`.")
 
     frida_version = (args.frida_version or os.environ.get("DECLAW_FRIDA_VERSION", "")).strip() or DEFAULT_FRIDA_VERSION
-    if frida_version != DEFAULT_FRIDA_VERSION:
-        log.warning(
-            "Using non-default Frida version %s. The default %s is pinned because "
-            "Frida 17.x gadget script mode silently fails on Android (upstream "
-            "issues frida/frida#3526, #3645). If your script doesn't run, this is "
-            "likely the cause.", frida_version, DEFAULT_FRIDA_VERSION,
-        )
+    if _frida_major(frida_version) >= 17:
+        if have_frida_compile():
+            log.info("Frida %s gadget + frida-compile (native bundle): works on "
+                     "every Android, including 16+.", frida_version)
+        else:
+            log.warning("Frida %s needs frida-compile (node) which is missing; will "
+                        "fall back to %s (Android <= 15 only). Install Node.js for "
+                        "Android 16+ support.", frida_version, FALLBACK_FRIDA_VERSION)
     else:
-        log.debug("Frida gadget pinned to %s (script-mode known-good).", frida_version)
+        log.warning("Frida %s: its Gum SIGSEGVs on Android 16+. Use the default %s "
+                    "(needs node) for new devices.", frida_version, DEFAULT_FRIDA_VERSION)
 
     abi_src = (args.gadget_abis or os.environ.get("DECLAW_GADGET_ABIS", "")).strip()
     extra_abis = {a.strip() for a in abi_src.split(",") if a.strip()}

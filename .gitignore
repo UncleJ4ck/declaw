@@ -16,3 +16,5 @@ saved_apks/
 # samples pulled during local testing
 samples/
 TESTING.md
+utils/fc/
+utils/
