@@ -782,6 +782,17 @@ def fetch_bypass_script(
              ", ".join(chosen))
 
     parts = [(url, _cache_fragment(url, refresh=refresh)) for url in urls]
+    # DECLAW_EXTRA_SCRIPT: a local .js prepended to the bundle (runs right after
+    # the header, before the fragments). For custom per-target hooks, e.g. a
+    # getaddrinfo override on an emulator whose system DNS is broken.
+    extra = os.environ.get("DECLAW_EXTRA_SCRIPT", "").strip()
+    if extra:
+        ep = Path(extra)
+        if ep.is_file():
+            parts.insert(0, (f"local:{ep.name}", ep.read_text(encoding="utf-8")))
+            log.info("Prepended custom script %s", ep.name)
+        else:
+            log.warning("DECLAW_EXTRA_SCRIPT=%s not found; ignoring", extra)
     out = dest or (UTILS_DIR / "universal-bypass.js")
     # The Java hardening hooks (NetCap/WebView/anti-debug) instrument ART methods,
     # which intermittently crash the concurrent mark-compact GC on Android 16+.
@@ -899,6 +910,13 @@ def _bypass_header(cert_pem: str, proxy_host: str, proxy_port: int,
                    debug_bundle: bool = False, java_hardening: bool = True) -> str:
     escaped_pem = cert_pem.strip()
     debug_flag = "true" if debug_bundle else "false"
+    # The connect-hook only SOCKS5-proxies redirected TCP when this is true; with
+    # false it does a transparent redirect that needs SO_ORIGINAL_DST (lost by the
+    # rewrite). declaw redirects arbitrary TCP to a host proxy, so SOCKS5 is the
+    # correct default: run mitmproxy `--mode socks5` or Burp's SOCKS listener.
+    # Override with DECLAW_PROXY_SOCKS5=0 for a transparent proxy.
+    socks5_flag = ("false" if os.environ.get("DECLAW_PROXY_SOCKS5", "").lower()
+                   in ("0", "false", "no") else "true")
     # When debug_bundle is on, route every console.log through android.util.Log
     # so output is visible under `adb logcat -s declaw:V`. Without this the
     # gadget's console output goes to a buffer that never reaches logcat.
@@ -1005,7 +1023,7 @@ def _bypass_header(cert_pem: str, proxy_host: str, proxy_port: int,
         f"const DEBUG_MODE = {debug_flag};\n"
         "const IGNORED_NON_HTTP_PORTS = [];\n"
         "const BLOCK_HTTP3 = true;\n"
-        "const PROXY_SUPPORTS_SOCKS5 = false;\n"
+        f"const PROXY_SUPPORTS_SOCKS5 = {socks5_flag};\n"
         f"{debug_block}"
         f"{hardening_block if java_hardening else ''}"
         "// ---- declaw header end ----\n"
