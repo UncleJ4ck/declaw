@@ -371,6 +371,13 @@ def _cached_jar(api_url: str, *, refresh: bool) -> Path:
 
 def fetch_bundletool(*, refresh: bool) -> Path:
     """Return a cached bundletool jar (for .aab -> .apks conversion)."""
+    # Offline fast path: reuse a cached bundletool-*.jar without a GitHub round
+    # trip (matters for air-gapped runs; see DECLAW_BYPASS_URLS docstring).
+    if not refresh:
+        cached = sorted(UTILS_DIR.glob("bundletool-*.jar"))
+        if cached:
+            log.debug("Using cached %s", cached[-1].name)
+            return cached[-1]
     info = _gh_latest(BUNDLETOOL_URL)
     asset = next((a for a in info.get("assets", []) if a["name"].endswith(".jar")), None)
     if asset is None:
@@ -672,11 +679,18 @@ def _static_patch_flutter_so(apk: Path) -> int:
         return 0
     cd_off = struct.unpack_from("<I", raw, eocd + 16)[0]
     cd_count = struct.unpack_from("<H", raw, eocd + 10)[0]
+    if cd_off == 0xFFFFFFFF or cd_count == 0xFFFF:
+        # zip64: real values live in the zip64 EOCD we do not parse. Bail rather
+        # than walk a bogus offset. APKs almost never hit this.
+        log.warning("zip64 APK %s: static libflutter patch skipped (use the "
+                    "runtime hook instead)", apk.name)
+        return 0
     total = 0
     p = cd_off
     for _ in range(cd_count):
         if raw[p:p + 4] != b"PK\x01\x02":
             break
+        gp_flag = struct.unpack_from("<H", raw, p + 8)[0]
         method = struct.unpack_from("<H", raw, p + 10)[0]
         comp_size = struct.unpack_from("<I", raw, p + 20)[0]
         name_len = struct.unpack_from("<H", raw, p + 28)[0]
@@ -703,7 +717,11 @@ def _static_patch_flutter_so(apk: Path) -> int:
                     raw[data_off:data_off + comp_size] = patched
                     crc = zlib.crc32(patched) & 0xFFFFFFFF
                     struct.pack_into("<I", raw, p + 16, crc)        # central dir
-                    struct.pack_into("<I", raw, lh_off + 14, crc)   # local header
+                    if not (gp_flag & 0x08):
+                        # Only update the local CRC when there is no trailing data
+                        # descriptor (bit 3). With a descriptor the local CRC is 0
+                        # and the authoritative copy is the central dir entry.
+                        struct.pack_into("<I", raw, lh_off + 14, crc)
                     total += len(hits)
                     log.info("Static Flutter TLS patch: %s %s -> %d site(s) at %s",
                              apk.name, name, len(hits),
@@ -818,7 +836,7 @@ _FC_SHIM = (
 
 
 def have_frida_compile() -> bool:
-    return shutil.which("npx") is not None and shutil.which("node") is not None
+    return all(shutil.which(t) is not None for t in ("node", "npm", "npx"))
 
 
 def _ensure_fc_project(*, refresh: bool = False) -> Path:
@@ -1070,7 +1088,13 @@ def auto_detect_proxy_host(serial: Optional[str], default_port: int = DEFAULT_PR
                 log.info("auto-proxy: phone %s on %s/24, using host %s:%d",
                          d.serial, host_prefix + ".0", host_ip, default_port)
                 return (host_ip, default_port)
-    log.debug("auto-proxy: no host iface shares a /24 with phone IPs %s", phone_ips)
+    # A real phone is connected but no host interface shares its subnet. The
+    # caller will bake the loopback default, which the phone cannot reach, so
+    # warn loudly rather than fail silently. Pass --proxy HOST:PORT explicitly.
+    log.warning("auto-proxy: phone %s reachable (IPs %s) but no host interface "
+                "shares its /24; bundle will use the loopback default, which the "
+                "phone CANNOT reach. Pass --proxy <host-ip>:%d explicitly.",
+                d.serial, phone_ips, default_port)
     return None
 
 
@@ -1436,6 +1460,10 @@ def extract_bundle(bundle_path: Path) -> Path:
         if apk.parent != out_dir:
             target = out_dir / apk.name
             if target.exists():
+                log.warning("Bundle has two splits named %s; keeping the later "
+                            "one (%s). If install-multiple later fails, the "
+                            "bundle nests distinct splits under the same name.",
+                            apk.name, apk)
                 target.unlink()
             shutil.move(str(apk), str(target))
     # Drop empty subdirs.
@@ -1490,8 +1518,15 @@ def _patch_void_method_to_noop(smali_path: Path, method_name: str) -> bool:
         r"(\.end method)",
         re.DOTALL,
     )
-    new_text, n = pattern.subn(r"\1    .locals 0\n    return-void\n\3", text)
-    if n > 0:
+    def repl(m: "re.Match[str]") -> str:
+        decl = m.group(1)
+        # abstract/native methods have no body; injecting one fails apktool build.
+        if re.search(r"\b(abstract|native)\b", decl):
+            return m.group(0)
+        return f"{decl}    .locals 0\n    return-void\n{m.group(3)}"
+
+    new_text, n = pattern.subn(repl, text)
+    if new_text != text:
         smali_path.write_text(new_text, encoding="utf-8")
         return True
     return False
@@ -2030,7 +2065,21 @@ def patch_base_apk(
                 if compiled is not None:
                     bypass_script = compiled
                 else:
+                    # No frida-compile: drop to the 16.x gadget, which runs raw
+                    # scripts AND tolerates the Java fragments (GC-safe on the
+                    # Android <= 15 devices this fallback targets). Re-assemble the
+                    # full bundle so we do not ship a needlessly degraded one.
                     eff_frida = FALLBACK_FRIDA_VERSION
+                    bypass_script = fetch_bypass_script(
+                        tools.cert_pem,
+                        refresh=tools.refresh,
+                        proxy_host=tools.proxy_host,
+                        proxy_port=tools.proxy_port,
+                        debug_bundle=tools.debug_bundle,
+                        frameworks=frameworks,
+                        dest=out_dir / "declaw-bypass.js",
+                        native_only=False,
+                    )
         inject_frida_gadget(
             unpacked,
             inspection,
