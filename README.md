@@ -68,7 +68,7 @@ under `adb logcat -s declaw:V`):
 
 These three are useful for traffic interception and rarely cause side
 effects. If you do need to disable them (debugging the bundle itself,
-auditing one hook at a time), edit `_bypass_header` in `declaw.py`
+auditing one hook at a time), edit `_bypass_header` in `declaw/bypass.py`
 between the `// ---- declaw hardening hooks` and `// ---- end declaw
 hardening` markers.
 

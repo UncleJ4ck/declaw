@@ -15,6 +15,7 @@ RUN apt-get update && \
 
 WORKDIR /app
 COPY declaw.py /app/
+COPY declaw/ /app/declaw/
 
 # utils/ is declared as a volume so the cached apktool, signer, gadget, and
 # bypass bundle survive across runs.
