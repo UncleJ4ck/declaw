@@ -182,6 +182,23 @@ package:com.example.bank
 4. Open the app. The gadget loads, the bundled script runs, pinning
    stops mattering, `connect()` lands on your proxy, you see cleartext.
 
+### Locked-down or rooted-emulator devices
+
+On modern Android (14+) or a locked-down emulator the app's UID can be
+firewalled off the LAN (no validated default network, per-UID eBPF egress
+deny), so it never reaches a proxy on your laptop's IP. Loopback is exempt,
+so route through it instead:
+
+```
+mitmdump --mode socks5 --listen-host 127.0.0.1 -p 8000 --ssl-insecure
+adb reverse tcp:8000 tcp:8000
+declaw --proxy 127.0.0.1:8000 --cert ~/.mitmproxy/mitmproxy-ca-cert.pem <app>
+```
+
+The connect hook sends every TCP to `127.0.0.1:8000`, `adb reverse` tunnels
+it to mitmproxy on the host (which has real internet), and `--cert` makes
+Conscrypt / OkHttp apps trust the proxy CA. The native bundle covers the rest.
+
 If an app still doesn't talk to you after that, it's usually one of:
 
 - A Play Integrity / SafetyNet check rejecting the debuggable build.
