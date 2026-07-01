@@ -32,6 +32,23 @@ from declaw.build import apktool_build, apktool_decode, install_apks, sign_apk
 from declaw.tools import Tools, abis_from_apks, frameworks_from_apks, prepare_tools
 
 
+def _prune_lib_abis(unpacked: Path, keep: str) -> None:
+    """Delete every lib/<abi> dir except `keep` from the unpacked tree, so the
+    rebuilt fat APK carries only the target device's arch. Big single-arch-target
+    win: a 3-arch bank app drops from ~360 MB to ~170 MB and installs in seconds.
+    No-op for split bundles (their base has no lib/)."""
+    lib_dir = unpacked / "lib"
+    if not lib_dir.is_dir():
+        return
+    removed = []
+    for arch_dir in lib_dir.iterdir():
+        if arch_dir.is_dir() and arch_dir.name != keep:
+            shutil.rmtree(arch_dir, ignore_errors=True)
+            removed.append(arch_dir.name)
+    if removed:
+        log.info("Pruned lib ABIs (keeping %s): dropped %s", keep, ", ".join(sorted(removed)))
+
+
 def patch_base_apk(
     base_apk: Path,
     out_dir: Path,
@@ -41,10 +58,13 @@ def patch_base_apk(
     refresh: bool,
     bundle_abis: Optional[set[str]] = None,
     bundle_frameworks: Optional[set[str]] = None,
+    keep_abi: Optional[str] = None,
 ) -> Path:
     unpacked = out_dir / "base.unpacked"
 
     apktool_decode(base_apk, unpacked, tools.apktool, with_sources=not minimal)
+    if keep_abi:
+        _prune_lib_abis(unpacked, keep_abi)
     inspection = inspect_unpacked(unpacked)
     # Frameworks from the base plus those found in the arch splits (libflutter
     # lives in split_config.<abi>.apk, not the base, so base-only detection
@@ -64,6 +84,8 @@ def patch_base_apk(
         if split_only:
             log.info("ABIs from arch splits: %s", ", ".join(sorted(split_only)))
         extra_abis |= bundle_abis
+    if keep_abi:
+        extra_abis &= {keep_abi}
 
     manifest_info = patch_manifest(unpacked)
     add_network_security_config(unpacked)
@@ -191,6 +213,7 @@ def run_pipeline(
     frida_version: str = DEFAULT_FRIDA_VERSION,
     auto: bool = False,
     capture_seconds: int = 90,
+    keep_abi: Optional[str] = None,
 ) -> int:
     target_path = Path(target)
     local_mode = target_path.exists()
@@ -209,10 +232,12 @@ def run_pipeline(
     if local_mode:
         return _run_local_mode(target_path, tools, output=output,
                                minimal=minimal, refresh=refresh,
-                               auto=auto, capture_seconds=capture_seconds)
+                               auto=auto, capture_seconds=capture_seconds,
+                               keep_abi=keep_abi)
     return _run_adb_mode(target, serial, tools, output=output,
                          minimal=minimal, refresh=refresh,
-                         auto=auto, capture_seconds=capture_seconds)
+                         auto=auto, capture_seconds=capture_seconds,
+                         keep_abi=keep_abi)
 
 
 def _collect_apks(path: Path, *, refresh: bool = False) -> list[Path]:
@@ -241,6 +266,7 @@ def _run_local_mode(
     refresh: bool,
     auto: bool = False,
     capture_seconds: int = 90,
+    keep_abi: Optional[str] = None,
 ) -> int:
     apks = _collect_apks(target_path, refresh=refresh)
     if not apks:
@@ -266,7 +292,8 @@ def _run_local_mode(
     bundle_frameworks = frameworks_from_apks(apks)
     patch_base_apk(base_apk, patched_out, tools,
                    minimal=minimal, refresh=refresh,
-                   bundle_abis=bundle_abis, bundle_frameworks=bundle_frameworks)
+                   bundle_abis=bundle_abis, bundle_frameworks=bundle_frameworks,
+                   keep_abi=keep_abi)
     sign_splits([a for a in apks if a != base_apk], patched_out, tools.signer)
 
     target_root = (output or PATCHED_DIR).expanduser().resolve()
@@ -286,9 +313,15 @@ def _run_adb_mode(
     refresh: bool,
     auto: bool = False,
     capture_seconds: int = 90,
+    keep_abi: Optional[str] = None,
 ) -> int:
     client = AdbClient(host=ADB_HOST, port=ADB_PORT)
     device = resolve_device(client, serial)
+
+    if keep_abi == "auto":
+        keep_abi = device.shell("getprop ro.product.cpu.abi").strip() or None
+        if keep_abi:
+            log.info("keep-abi auto: device arch is %s", keep_abi)
 
     pkg = package.removeprefix("package:").strip()
 
@@ -316,7 +349,8 @@ def _run_adb_mode(
     final_base = patch_base_apk(base_apk, patched_out, tools,
                                 minimal=minimal, refresh=refresh,
                                 bundle_abis=bundle_abis,
-                                bundle_frameworks=bundle_frameworks)
+                                bundle_frameworks=bundle_frameworks,
+                                keep_abi=keep_abi)
     final_splits = sign_splits(
         [a for a in apks if a != base_apk], patched_out, tools.signer
     )

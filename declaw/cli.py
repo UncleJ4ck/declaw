@@ -57,6 +57,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                         f"because Frida 17.x gadget script mode is broken on Android "
                         f"(silent no-op). Use 'latest' if upstream has shipped a fix. "
                         f"Overrides DECLAW_FRIDA_VERSION env var.")
+    p.add_argument("--keep-abi", metavar="ABI", default="",
+                   help="Strip a fat multi-arch APK down to a single ABI (e.g. x86_64 "
+                        "for an emulator, arm64-v8a for a phone). Much smaller, installs "
+                        "in seconds. Use 'auto' in adb mode to match the device. No-op on "
+                        "split bundles.")
     p.add_argument("--minimal", action="store_true",
                    help="NSC only. Skip the Frida gadget, keep the APK small.")
     p.add_argument("--refresh", action="store_true",
@@ -169,6 +174,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             frida_version=frida_version,
             auto=bool(args.auto),
             capture_seconds=args.capture_seconds,
+            keep_abi=(args.keep_abi.strip() or None),
         )
     except requests.RequestException as exc:
         log.error("Network error: %s", exc)
