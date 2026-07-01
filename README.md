@@ -89,6 +89,8 @@ declaw --minimal com.example.app          # NSC only, skip the gadget
 declaw -c ~/.mitmproxy/ca.pem com.bank    # bake in your proxy's CA
 declaw --proxy 192.168.1.10:8080 com.bank # redirect TCP to your laptop's proxy
 declaw --refresh com.example.app          # re-download every cached tool
+declaw --auto com.reddit.frontpage        # detect the stack, pick patch or friTap
+declaw --capture com.reddit.frontpage     # force friTap key-extraction (pinned apps)
 ```
 
 If the positional argument is an existing file or directory, declaw
@@ -106,6 +108,9 @@ package name and declaw will pull it over ADB.
 | `--frida-version` | Pin the Frida gadget version. Default `16.7.19` because Frida 17.x gadget script mode is broken on Android (silent no-op, upstream `frida/frida#3526`, `#3645`). Use `latest` only when upstream has shipped a fix. |
 | `--debug-bundle` | Flip `DEBUG_MODE=true` in the bundled hooks and bridge `console.log` to `Log.d("declaw", ...)` so output is visible under `adb logcat -s declaw:V`. |
 | `--minimal` | NSC only. Skip the gadget. Patched APK stays close to the original size. |
+| `--auto` | Analyze the APK and pick the strategy: patch for OkHttp/Flutter/standard TLS, friTap capture for cronet / hard-pinned / anti-tamper apps. In adb mode it runs the chosen mode end to end. |
+| `--capture` | Force friTap key-extraction mode (for cronet/pinned apps the patch cannot beat). Needs root and the `fritap` CLI. See the friTap section below. |
+| `--capture-seconds N` | Capture window for `--capture` / `--auto` capture (default 90). Drive the app during it. |
 | `--refresh` | Re-download everything cached in `utils/`. |
 | `-v`, `--verbose` | DEBUG logging. Shows every subprocess and cache hit. |
 
@@ -117,6 +122,7 @@ package name and declaw will pull it over ADB.
 | `DECLAW_CERT_PEM` | Path to a PEM, used when `-c` is not passed. |
 | `DECLAW_PROXY` | `HOST:PORT` for the bundled `connect()` hook, used when `--proxy` is not passed. |
 | `DECLAW_FRIDA_VERSION` | Override the pinned Frida gadget version, used when `--frida-version` is not passed. |
+| `DECLAW_FRITAP_SPEC` | pip target for the bundled friTap (capture mode). Defaults to PyPI `friTap`. Set to a fork, e.g. `git+https://github.com/you/friTap`, to develop friTap yourself. `--refresh` reinstalls it. |
 | `DECLAW_DEBUG_BUNDLE` | Truthy value (`1`, `true`) enables the debug bundle, used when `--debug-bundle` is not passed. |
 | `GITHUB_TOKEN` | Passed to the GitHub release API so the latest-release calls don't hit anonymous rate limits. |
 | `ADB_HOST`, `ADB_PORT` | Point at a non-default adb server. |
@@ -210,6 +216,64 @@ If an app still doesn't talk to you after that, it's usually one of:
 - Pinning in a library the httptoolkit bundle doesn't cover. Add a URL
   to `DECLAW_BYPASS_URLS` that points at your own script.
 
+## Decrypting cronet / hard-pinned apps (friTap)
+
+Some apps cannot be beaten by patching. cronet (Chromium's network stack,
+used by Reddit and many Google-adjacent apps) statically links its own
+BoringSSL and hard-pins its servers, so the CA + NSC patch is rejected and the
+handshake aborts. Anti-tamper packers (PairIP, DexGuard, Jiagu) detect the
+re-signed APK and refuse to run.
+
+For these, declaw has a capture mode that never sits in the middle. It runs
+[friTap](https://github.com/fkie-cad/friTap) against the **unmodified** app:
+friTap hooks the app's own BoringSSL and logs the TLS session keys, so the real
+pinned traffic decrypts afterward with no MITM, no cert, and nothing for the pin
+or the tamper check to detect.
+
+`--auto` detects which case you're in and routes for you:
+
+```bash
+declaw --auto com.reddit.frontpage   # sees libcronet -> runs friTap capture
+declaw --auto com.some.okhttp.app    # sees OkHttp    -> patches as usual
+```
+
+Or force it with `--capture`. friTap is provisioned automatically: on first use
+declaw creates a managed venv at `utils/fritap-venv` (via `uv`, falling back to
+`python -m venv`), installs friTap there, and downloads a `frida-server` matched
+to that friTap's exact frida version. No manual install. It needs:
+
+- **root** (an emulator, or a rooted device). friTap drives a `frida-server`
+  that declaw pushes and starts; that needs root. On a non-rooted device use the
+  patch mode instead.
+- network on first run (to install friTap and fetch frida-server; both cached after).
+- **tshark** (Wireshark CLI) to decode, optional.
+
+```bash
+declaw --capture --capture-seconds 90 com.reddit.frontpage
+# drive the app during the window so it makes the calls you want, then:
+tshark -r captures/traffic.pcap -d tcp.port==443,http2 \
+  -Y http2.headers.authority -T fields -e http2.headers.authority
+```
+
+Output lands in `captures/` (or `-o DIR`): `keys.log` (NSS key log) and
+`traffic.pcap` (decrypted). Open the pcap in Wireshark or decode with tshark.
+
+Worked example, Reddit (cronet, pinned, gated behind login). The emulator's
+Credential Manager blocks scripted login, so log in with Reddit's email magic
+link fired straight into the app, then capture:
+
+```bash
+# 1. trigger "email me a login link" in the app, open the email, copy the link
+adb shell am start -a android.intent.action.VIEW \
+  -d '<magic_link_url>' com.reddit.frontpage
+# 2. once you're on the feed:
+declaw --capture com.reddit.frontpage
+```
+
+This decrypts `gql-fed.reddit.com` (Reddit's GraphQL), `www.reddit.com`,
+`matrix.redditspace.com` and the rest, all of which hard-pin and fail a normal
+CA MITM.
+
 ## Exit codes
 
 | Code | Meaning |
@@ -219,6 +283,7 @@ If an app still doesn't talk to you after that, it's usually one of:
 | 2 | Bad args, wrong device, bad cert path. |
 | 3 | Package not installed or no APKs in the given path. |
 | 4 | Network error fetching tooling. |
+| 5 | Capture mode ran but extracted no TLS keys (app made no calls, or needs root). |
 | 6 | apktool, signer, or adb failed. |
 | 130 | Ctrl-C. |
 

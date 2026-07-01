@@ -11,7 +11,7 @@ import sys
 
 import requests
 
-from declaw.config import DEFAULT_CERT_PEM, DEFAULT_FRIDA_VERSION, FALLBACK_FRIDA_VERSION, _frida_major, log
+from declaw.config import DEFAULT_CERT_PEM, DEFAULT_FRIDA_VERSION, FALLBACK_FRIDA_VERSION, ROOT_DIR, _frida_major, log
 from declaw.bypass import have_frida_compile
 from declaw.device import auto_detect_proxy_host, parse_proxy
 from declaw.pipeline import run_pipeline
@@ -63,6 +63,20 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                    help="Force re-download of apktool, signer, gadget, and bypass script.")
     p.add_argument("-v", "--verbose", action="store_true",
                    help="Debug logging. Shows every subprocess and cache hit.")
+    p.add_argument("--auto", action="store_true",
+                   help="Analyze the APK and pick the strategy automatically: patch "
+                        "(OkHttp/Flutter/standard TLS) or friTap capture (cronet / "
+                        "hard-pinned / anti-tamper apps). In adb mode it runs the chosen "
+                        "mode end to end.")
+    p.add_argument("--capture", action="store_true",
+                   help="Passive key-extraction mode for PINNED apps (Reddit/cronet) "
+                        "the patch cannot beat. Runs friTap + frida-server on the "
+                        "device, logs TLS session keys + a pcap, no MITM and no cert. "
+                        "TARGET must be a package name. Needs root (emulator or rooted "
+                        "device) and the `fritap` CLI on PATH.")
+    p.add_argument("--capture-seconds", type=int, default=90, metavar="N",
+                   help="How long to capture in --capture mode (default 90). Drive the "
+                        "app during this window so it makes the TLS calls you want.")
     return p.parse_args(argv)
 
 
@@ -86,6 +100,19 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv)
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
+
+    if args.capture:
+        from declaw.capture import run_capture
+        out_dir = Path(args.output) if args.output else (ROOT_DIR / "captures")
+        try:
+            return run_capture(args.target, args.serial, out_dir,
+                               seconds=args.capture_seconds, refresh=args.refresh)
+        except requests.RequestException as exc:
+            log.error("Network error: %s", exc)
+            return 4
+        except KeyboardInterrupt:
+            log.error("Interrupted.")
+            return 130
 
     cert_pem = load_cert_pem(args)
 
@@ -140,6 +167,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             proxy_port=proxy_port,
             debug_bundle=debug_bundle,
             frida_version=frida_version,
+            auto=bool(args.auto),
+            capture_seconds=args.capture_seconds,
         )
     except requests.RequestException as exc:
         log.error("Network error: %s", exc)

@@ -19,7 +19,8 @@ except ImportError as exc:  # pragma: no cover
     )
     sys.exit(1)
 
-from declaw.config import AAB_EXTENSION, ADB_HOST, ADB_PORT, BUNDLE_EXTENSIONS, DEFAULT_FRIDA_VERSION, FALLBACK_FRIDA_VERSION, PACKAGES_DIR, PATCHED_DIR, _frida_major, log
+from declaw.config import AAB_EXTENSION, ADB_HOST, ADB_PORT, BUNDLE_EXTENSIONS, DEFAULT_FRIDA_VERSION, FALLBACK_FRIDA_VERSION, PACKAGES_DIR, PATCHED_DIR, ROOT_DIR, _frida_major, log
+from declaw.analyze import analyze_apks, log_profile
 from declaw.shell import convert_aab
 from declaw.flutter import _static_patch_flutter_so
 from declaw.bypass import fetch_bypass_script, frida_compile_bundle
@@ -188,6 +189,8 @@ def run_pipeline(
     proxy_port: int,
     debug_bundle: bool = False,
     frida_version: str = DEFAULT_FRIDA_VERSION,
+    auto: bool = False,
+    capture_seconds: int = 90,
 ) -> int:
     target_path = Path(target)
     local_mode = target_path.exists()
@@ -205,9 +208,11 @@ def run_pipeline(
 
     if local_mode:
         return _run_local_mode(target_path, tools, output=output,
-                               minimal=minimal, refresh=refresh)
+                               minimal=minimal, refresh=refresh,
+                               auto=auto, capture_seconds=capture_seconds)
     return _run_adb_mode(target, serial, tools, output=output,
-                         minimal=minimal, refresh=refresh)
+                         minimal=minimal, refresh=refresh,
+                         auto=auto, capture_seconds=capture_seconds)
 
 
 def _collect_apks(path: Path, *, refresh: bool = False) -> list[Path]:
@@ -234,11 +239,20 @@ def _run_local_mode(
     output: Optional[Path],
     minimal: bool,
     refresh: bool,
+    auto: bool = False,
+    capture_seconds: int = 90,
 ) -> int:
     apks = _collect_apks(target_path, refresh=refresh)
     if not apks:
         log.error("No .apk files in %s", target_path)
         return 3
+
+    mode, _reason = log_profile(analyze_apks(apks))
+    if auto and mode == "capture":
+        log.warning("--auto: this app needs friTap capture, which runs against an "
+                    "INSTALLED app on a device. Install it, then run "
+                    "`declaw <package> --capture`. Patching anyway so you still get "
+                    "an APK for the non-pinned traffic.")
 
     label = target_path.stem if target_path.is_file() else target_path.name
     patched_out = PATCHED_DIR / f"{label}_patched"
@@ -270,6 +284,8 @@ def _run_adb_mode(
     output: Optional[Path],
     minimal: bool,
     refresh: bool,
+    auto: bool = False,
+    capture_seconds: int = 90,
 ) -> int:
     client = AdbClient(host=ADB_HOST, port=ADB_PORT)
     device = resolve_device(client, serial)
@@ -285,6 +301,15 @@ def _run_adb_mode(
     base_apk = identify_base_apk(apks)
     log.info("ADB mode | device=%s, base=%s, splits=%d",
              device.serial, base_apk.name, len(apks) - 1)
+
+    mode, _reason = log_profile(analyze_apks(apks))
+    if auto and mode == "capture":
+        # The app is already installed on the device; friTap spawns it directly.
+        from declaw.capture import run_capture
+        out_dir = (output.expanduser().resolve() if output else (ROOT_DIR / "captures"))
+        log.info("--auto: routing to friTap capture for %s", pkg)
+        return run_capture(pkg, device.serial, out_dir,
+                           seconds=capture_seconds, refresh=refresh)
 
     bundle_abis = abis_from_apks(apks)
     bundle_frameworks = frameworks_from_apks(apks)
