@@ -72,6 +72,22 @@ auditing one hook at a time), edit `_bypass_header` in `declaw/bypass.py`
 between the `// ---- declaw hardening hooks` and `// ---- end declaw
 hardening` markers.
 
+Where a gadget is the wrong tool, declaw patches the native libraries
+directly at repack time, so the bypass survives when the gadget crashes or
+the app ignores your proxy:
+
+- Flutter carries its own BoringSSL inside `libflutter.so` and pins against a
+  baked-in trust store, ignoring the system store and any user CA. declaw
+  byte-patches `ssl_verify_peer_cert` in the bundled `libflutter.so` to return
+  success (NVISO's `disable-flutter-tls` signatures), no Frida and no runtime.
+- When the app's Flutter engine snapshot hash is one that reFlutter publishes
+  a pre-patched engine for, declaw downloads that engine for the exact version
+  and ABI and swaps the whole `.so` in, instead of byte-patching. It falls back
+  to the byte-patch (or the Frida hooks) when the hash is unknown.
+- For a non-Flutter app that bundles its own BoringSSL, the same eight-byte
+  `ssl_verify_peer_cert` stub is written into the bundled `libssl.so` on disk,
+  the static counterpart of `--mode mempatch` for a device with no root.
+
 All the downloaded tooling (apktool, uber-apk-signer, the gadget, the
 script bundle) gets cached under `utils/`. First run is the slow one.
 
@@ -107,11 +123,14 @@ package name and declaw will pull it over ADB.
 | `-o`, `--output` | Copy the patched APKs into this directory (timestamped). |
 | `-c`, `--cert` | Path to a PEM to bake into `CERT_PEM` for the bundled hooks. |
 | `--proxy` | `HOST:PORT` of your intercepting proxy. Baked into the bundled `connect()` hook so Flutter and other proxy-ignoring apps route to it. |
-| `--frida-version` | Pin the Frida gadget version. Default `16.7.19` because Frida 17.x gadget script mode is broken on Android (silent no-op, upstream `frida/frida#3526`, `#3645`). Use `latest` only when upstream has shipped a fix. |
+| `--frida-version` | Pin the Frida gadget version. Default `17.15.2`. declaw compiles the bundle through frida-compile so the 17.x gadget runs it on every Android, and falls back to `16.7.19` only when node / frida-compile is missing. Use `latest` to track upstream. |
+| `--gadget-abis` | Comma-separated extra ABIs to inject the gadget into (e.g. `x86_64` when patching an arm64 APK for an x86_64 emulator). Combined with what the APK already ships. |
 | `--debug-bundle` | Flip `DEBUG_MODE=true` in the bundled hooks and bridge `console.log` to `Log.d("declaw", ...)` so output is visible under `adb logcat -s declaw:V`. |
 | `--minimal` | NSC only. Skip the gadget. Patched APK stays close to the original size. |
+| `--keep-abi` | Strip a fat multi-arch APK down to a single ABI (e.g. `x86_64` for an emulator, `arm64-v8a` for a phone). Much smaller, installs in seconds. Use `auto` in adb mode to match the device. No-op on split bundles. |
 | `--mode` | What declaw does (default `auto`). `auto`: analyze and pick. `patch`: repackage the APK with the bypass baked in. `capture`: friTap key+pcap for pinned apps like cronet (root). `hwbp`: zero-injection hardware-breakpoint key capture (root+arm64). `mempatch`: zero-footprint in-memory cert-verify patch via `/proc/pid/mem`, no file change / no frida / no ptrace-attach (root+arm64, needs `--offset`). |
 | `--offset` | `LIB@OFFSET` of `ssl_verify_peer_cert` in the app's BoringSSL, for `--mode patch` (baked into the `.so`) or `--mode mempatch` (written into the running process). e.g. `libssl.so@0x1f13c`. |
+| `--verify` | After `--mode mempatch`, confirm the patched `ssl_verify_peer_cert` actually executes on a handshake (non-destructive HW breakpoint), and revert to the original bytes if it never fires. Drive the app during the watch so it makes an HTTPS request. |
 | `--capture-seconds N` | Capture window for `--mode capture` (default 90). Drive the app during it. |
 | `--refresh` | Re-download everything cached in `utils/`. |
 | `-v`, `--verbose` | DEBUG logging. Shows every subprocess and cache hit. |

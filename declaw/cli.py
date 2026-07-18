@@ -68,10 +68,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                         "(e.g. x86_64 when patching a Pixel arm64 APK for an "
                         "x86_64 emulator). Combined with what's in the APK.")
     p.add_argument("--frida-version", metavar="X.Y.Z", default="",
-                   help=f"Pin Frida gadget version. Default {DEFAULT_FRIDA_VERSION} "
-                        f"because Frida 17.x gadget script mode is broken on Android "
-                        f"(silent no-op). Use 'latest' if upstream has shipped a fix. "
-                        f"Overrides DECLAW_FRIDA_VERSION env var.")
+                   help=f"Pin Frida gadget version. Default {DEFAULT_FRIDA_VERSION}; "
+                        f"declaw compiles the bundle through frida-compile so the 17.x "
+                        f"gadget runs it on every Android, falling back to "
+                        f"{FALLBACK_FRIDA_VERSION} when node/frida-compile is missing. "
+                        f"Use 'latest' to track upstream. Overrides DECLAW_FRIDA_VERSION env var.")
     p.add_argument("--keep-abi", metavar="ABI", default="",
                    help="Strip a fat multi-arch APK down to a single ABI (e.g. x86_64 "
                         "for an emulator, arm64-v8a for a phone). Much smaller, installs "
