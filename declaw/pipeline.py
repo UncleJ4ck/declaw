@@ -402,13 +402,27 @@ def _run_adb_mode(
     profile = analyze_apks(apks)
     mode, _reason = log_profile(profile)
     if auto and mode == "capture":
-        # The app is already installed on the device; friTap spawns it directly.
-        from declaw.capture import run_capture
-        out_dir = (output.expanduser().resolve() if output else (ROOT_DIR / "captures"))
-        log.info("--auto: routing to friTap capture for %s", pkg)
-        return run_capture(pkg, device.serial, out_dir,
-                           seconds=capture_seconds, refresh=refresh,
-                           anti_pairip=bool(profile.anti_tamper))
+        # A mixed app (cronet + a patchable stack) on a non-rooted device would otherwise
+        # get nothing: capture needs root, and the hard capture return dropped the patch.
+        # For that case, mirror local mode: still build the patch for the non-cronet
+        # traffic. Keep capture-only for anti-tamper (a re-signed patch gets detected) and
+        # for pure cronet (no patchable stack, so a patch would be an empty win).
+        patchable = (profile.okhttp or profile.java_pinning or profile.conscrypt
+                     or "flutter" in profile.frameworks or bool(profile.bundled_boringssl))
+        if profile.cronet and not profile.anti_tamper and patchable:
+            log.warning("--auto: %s bundles cronet (which needs friTap capture) but also "
+                        "has a patchable stack; building the patched APK too so the "
+                        "non-cronet traffic is covered. Run `declaw %s --capture` for the "
+                        "cronet flows.", pkg, pkg)
+            # fall through to the patch pipeline below
+        else:
+            # The app is already installed on the device; friTap spawns it directly.
+            from declaw.capture import run_capture
+            out_dir = (output.expanduser().resolve() if output else (ROOT_DIR / "captures"))
+            log.info("--auto: routing to friTap capture for %s", pkg)
+            return run_capture(pkg, device.serial, out_dir,
+                               seconds=capture_seconds, refresh=refresh,
+                               anti_pairip=bool(profile.anti_tamper))
 
     bundle_abis = abis_from_apks(apks)
     bundle_frameworks = frameworks_from_apks(apks)
