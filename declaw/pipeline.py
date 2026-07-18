@@ -57,6 +57,35 @@ def _prune_lib_abis(unpacked: Path, keep: str) -> None:
         log.info("Pruned lib ABIs (keeping %s): dropped %s", keep, ", ".join(sorted(removed)))
 
 
+def _pick_abi(abilist: list[str], app_abis: set[str]) -> Optional[str]:
+    """The first device-preferred ABI (abilist is the device's priority order) that
+    the app actually ships, or None when nothing matches. Pure, so it is unit-tested.
+
+    This is why keep-abi=auto is safe to default: on a phone it keeps the primary
+    arch, on an x86_64 emulator running an arm64-only app it keeps arm64-v8a (the
+    translated lib) instead of the emulator's absent x86_64, and for a 32-bit-only
+    app it keeps armeabi-v7a rather than the device's 64-bit primary. No match ->
+    None -> _prune_lib_abis keeps every ABI, so a mismatch never strips to empty."""
+    return next((a for a in abilist if a in app_abis), None)
+
+
+def _resolve_auto_abi(device, app_abis: set[str]) -> Optional[str]:
+    """Resolve keep-abi=auto to a single concrete ABI using the device's full abilist
+    (priority order) against the ABIs the app ships. Returns None to keep everything."""
+    abilist = [a.strip() for a in device.shell("getprop ro.product.cpu.abilist").split(",") if a.strip()]
+    if not abilist:
+        one = device.shell("getprop ro.product.cpu.abi").strip()
+        abilist = [one] if one else []
+    chosen = _pick_abi(abilist, app_abis)
+    if chosen:
+        log.info("keep-abi auto: device prefers [%s], app ships [%s] -> keeping %s",
+                 ",".join(abilist), ",".join(sorted(app_abis)) or "none", chosen)
+    else:
+        log.info("keep-abi auto: no device ABI [%s] matches the app's [%s]; keeping all",
+                 ",".join(abilist) or "none", ",".join(sorted(app_abis)) or "none")
+    return chosen
+
+
 def _patch_base_boringssl(unpacked: Path, spec: str) -> None:
     """Apply the ssl_verify_ok stub to a bundled BoringSSL that rides in the BASE apk
     (monolithic / base-resident libs), which the split-only raw-zip path never sees.
@@ -382,11 +411,6 @@ def _run_adb_mode(
     client = AdbClient(host=ADB_HOST, port=ADB_PORT)
     device = resolve_device(client, serial)
 
-    if keep_abi == "auto":
-        keep_abi = device.shell("getprop ro.product.cpu.abi").strip() or None
-        if keep_abi:
-            log.info("keep-abi auto: device arch is %s", keep_abi)
-
     pkg = safe_pkg(package.removeprefix("package:").strip())
 
     original_out = PACKAGES_DIR / pkg
@@ -400,6 +424,8 @@ def _run_adb_mode(
              device.serial, base_apk.name, len(apks) - 1)
 
     profile = analyze_apks(apks)
+    if keep_abi == "auto":
+        keep_abi = _resolve_auto_abi(device, set(profile.abis))
     mode, _reason = log_profile(profile)
     if auto and mode == "capture":
         # A mixed app (cronet + a patchable stack) on a non-rooted device would otherwise

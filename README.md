@@ -101,7 +101,7 @@ declaw ./split_apks/ -o ~/pentest/out     # directory of splits, save a copy
 declaw ./app.xapk                         # APKPure bundle, auto-extracted
 declaw ./app.apks                         # SAI / bundletool split-APK set
 declaw ./app.aab                          # Google App Bundle (uses bundletool)
-declaw --minimal com.example.app          # NSC only, skip the gadget
+declaw --mode minimal com.example.app     # NSC only, skip the gadget
 declaw -c ~/.mitmproxy/ca.pem com.bank    # bake in your proxy's CA
 declaw --proxy 192.168.1.10:8080 com.bank # redirect TCP to your laptop's proxy
 declaw --refresh com.example.app          # re-download every cached tool
@@ -123,12 +123,8 @@ package name and declaw will pull it over ADB.
 | `-o`, `--output` | Copy the patched APKs into this directory (timestamped). |
 | `-c`, `--cert` | Path to a PEM to bake into `CERT_PEM` for the bundled hooks. |
 | `--proxy` | `HOST:PORT` of your intercepting proxy. Baked into the bundled `connect()` hook so Flutter and other proxy-ignoring apps route to it. |
-| `--frida-version` | Pin the Frida gadget version. Default `17.15.2`. declaw compiles the bundle through frida-compile so the 17.x gadget runs it on every Android, and falls back to `16.7.19` only when node / frida-compile is missing. Use `latest` to track upstream. |
-| `--gadget-abis` | Comma-separated extra ABIs to inject the gadget into (e.g. `x86_64` when patching an arm64 APK for an x86_64 emulator). Combined with what the APK already ships. |
-| `--debug-bundle` | Flip `DEBUG_MODE=true` in the bundled hooks and bridge `console.log` to `Log.d("declaw", ...)` so output is visible under `adb logcat -s declaw:V`. |
-| `--minimal` | NSC only. Skip the gadget. Patched APK stays close to the original size. |
-| `--keep-abi` | Strip a fat multi-arch APK down to a single ABI (e.g. `x86_64` for an emulator, `arm64-v8a` for a phone). Much smaller, installs in seconds. Use `auto` in adb mode to match the device. No-op on split bundles. |
-| `--mode` | What declaw does (default `auto`). `auto`: analyze and pick. `patch`: repackage the APK with the bypass baked in. `capture`: friTap key+pcap for pinned apps like cronet (root). `hwbp`: zero-injection hardware-breakpoint key capture (root+arm64). `mempatch`: zero-footprint in-memory cert-verify patch via `/proc/pid/mem`, no file change / no frida / no ptrace-attach (root+arm64, needs `--offset`). |
+| `--mode` | What declaw does (default `auto`). `auto`: analyze and pick. `patch`: repackage the APK with the bypass baked in. `minimal`: NSC only, skip the gadget, keep the APK small. `capture`: friTap key+pcap for pinned apps like cronet (root). `hwbp`: zero-injection hardware-breakpoint key capture (root+arm64). `mempatch`: zero-footprint in-memory cert-verify patch via `/proc/pid/mem`, no file change / no frida / no ptrace-attach (root+arm64, needs `--offset`). |
+| `--keep-abi` | Which native ABI to keep in a fat multi-arch APK. Default `auto` strips to the connected device's arch (much smaller, installs in seconds); `all` keeps every ABI; or name one (`arm64-v8a`, `x86_64`). No-op on split bundles and in local-file mode. |
 | `--offset` | `LIB@OFFSET` of `ssl_verify_peer_cert` in the app's BoringSSL, for `--mode patch` (baked into the `.so`) or `--mode mempatch` (written into the running process). e.g. `libssl.so@0x1f13c`. |
 | `--verify` | After `--mode mempatch`, confirm the patched `ssl_verify_peer_cert` actually executes on a handshake (non-destructive HW breakpoint), and revert to the original bytes if it never fires. Drive the app during the watch so it makes an HTTPS request. |
 | `--capture-seconds N` | Capture window for `--mode capture` (default 90). Drive the app during it. |
@@ -144,7 +140,8 @@ The old mode flags (`--auto`, `--capture`, `--hwbp-capture`, `--patch-boringssl`
 | `DECLAW_BYPASS_URLS` | `;` separated list of JS URLs to concatenate into the bundle. Overrides the default. |
 | `DECLAW_CERT_PEM` | Path to a PEM, used when `-c` is not passed. |
 | `DECLAW_PROXY` | `HOST:PORT` for the bundled `connect()` hook, used when `--proxy` is not passed. |
-| `DECLAW_FRIDA_VERSION` | Override the pinned Frida gadget version, used when `--frida-version` is not passed. |
+| `DECLAW_FRIDA_VERSION` | Override the pinned Frida gadget version (default `17.15.2`, falls back to `16.7.19` without node/frida-compile). |
+| `DECLAW_GADGET_ABIS` | Comma-separated extra ABIs to inject the gadget into (e.g. `x86_64` when patching an arm64 APK for an x86_64 emulator), on top of what the APK ships. |
 | `DECLAW_FRITAP_SPEC` | pip target for the bundled friTap (capture mode). Defaults to PyPI `friTap`. Set to a fork, e.g. `git+https://github.com/you/friTap`, to develop friTap yourself. `--refresh` reinstalls it. |
 | `DECLAW_ANTI_PAIRIP` | Force-load the bundled anti-PairIP frida script in capture mode. Auto-enabled when the analyzer detects an anti-tamper packer (PairIP). Best-known generic native bypass; some hardened apps may still resist. |
 | `DECLAW_STEALTH_FRIDA` | Harden the frida-server binary against anti-frida scans (rename frida symbols/strings/threads). Off by default: the patch can corrupt the frida-agent on some frida versions and crash the target. Use only when frida-server detection is the specific blocker. |

@@ -44,11 +44,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                         "Flutter and any app that ignores the system proxy (the "
                         "native-connect hook redirects TCP here). Overrides "
                         "DECLAW_PROXY env var. Default 127.0.0.1:8000.")
-    p.add_argument("--mode", choices=["auto", "patch", "capture", "hwbp", "mempatch"],
+    p.add_argument("--mode", choices=["auto", "patch", "minimal", "capture", "hwbp", "mempatch"],
                    default="auto",
                    help="What declaw does (default auto). "
                         "auto: analyze the app and pick the best strategy. "
                         "patch: repackage the APK with the bypass baked in (OkHttp/Flutter). "
+                        "minimal: NSC only, skip the gadget, keep the APK small. "
                         "capture: friTap key+pcap capture for pinned apps like cronet (root). "
                         "hwbp: zero-injection hardware-breakpoint key capture (root+arm64). "
                         "mempatch: zero-footprint in-memory cert-verify patch (root+arm64+--offset).")
@@ -59,27 +60,16 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                         "LIB@auto auto-locates the LIVE ssl_verify_peer_cert (not the "
                         "ssl_reverify_peer_cert decoy, which patches cleanly but does nothing). "
                         "Print it for any .so with `python -m declaw.find_verify <lib.so>`.")
-    p.add_argument("--debug-bundle", action="store_true",
-                   help="Flip DEBUG_MODE=true in the bundled Frida script so every "
-                        "connect() rewrite and pinning hook gets logged. View with "
-                        "`adb logcat -s frida-gadget:*`.")
-    p.add_argument("--gadget-abis", metavar="LIST", default="",
-                   help="Comma-separated extra ABIs to inject the gadget into "
-                        "(e.g. x86_64 when patching a Pixel arm64 APK for an "
-                        "x86_64 emulator). Combined with what's in the APK.")
-    p.add_argument("--frida-version", metavar="X.Y.Z", default="",
-                   help=f"Pin Frida gadget version. Default {DEFAULT_FRIDA_VERSION}; "
-                        f"declaw compiles the bundle through frida-compile so the 17.x "
-                        f"gadget runs it on every Android, falling back to "
-                        f"{FALLBACK_FRIDA_VERSION} when node/frida-compile is missing. "
-                        f"Use 'latest' to track upstream. Overrides DECLAW_FRIDA_VERSION env var.")
-    p.add_argument("--keep-abi", metavar="ABI", default="",
-                   help="Strip a fat multi-arch APK down to a single ABI (e.g. x86_64 "
-                        "for an emulator, arm64-v8a for a phone). Much smaller, installs "
-                        "in seconds. Use 'auto' in adb mode to match the device. No-op on "
-                        "split bundles.")
-    p.add_argument("--minimal", action="store_true",
-                   help="NSC only. Skip the Frida gadget, keep the APK small.")
+    p.add_argument("--debug-bundle", action="store_true", help=argparse.SUPPRESS)
+    # Power-user knobs kept off the default --help; each reads its DECLAW_* env var.
+    p.add_argument("--gadget-abis", metavar="LIST", default="", help=argparse.SUPPRESS)
+    p.add_argument("--frida-version", metavar="X.Y.Z", default="", help=argparse.SUPPRESS)
+    p.add_argument("--keep-abi", metavar="ABI", default="auto",
+                   help="Which native ABI to keep in a fat multi-arch APK. Default 'auto' "
+                        "strips to the connected device's arch (much smaller, installs in "
+                        "seconds); 'all' keeps every ABI; or name one (e.g. arm64-v8a, "
+                        "x86_64). No-op on split bundles and in local-file mode.")
+    p.add_argument("--minimal", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--refresh", action="store_true",
                    help="Force re-download of apktool, signer, gadget, and bypass script.")
     p.add_argument("--verify", action="store_true",
@@ -232,12 +222,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     if extra_abis:
         log.info("Extra gadget ABIs requested: %s", ", ".join(sorted(extra_abis)))
 
+    # --mode minimal folds the old --minimal flag: skip the gadget, NSC only.
+    minimal = bool(args.minimal) or mode == "minimal"
+    # "all"/"none" (or empty) keep every ABI; "auto" resolves per device; else one ABI.
+    keep_abi = None if args.keep_abi.strip().lower() in ("all", "none", "") else args.keep_abi.strip()
+
     try:
         return run_pipeline(
             target=args.target,
             serial=args.serial,
             output=Path(args.output) if args.output else None,
-            minimal=args.minimal,
+            minimal=minimal,
             refresh=args.refresh,
             cert_pem=cert_pem,
             extra_abis=extra_abis,
@@ -247,7 +242,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             frida_version=frida_version,
             auto=(mode == "auto"),
             capture_seconds=args.capture_seconds,
-            keep_abi=(args.keep_abi.strip() or None),
+            keep_abi=keep_abi,
             patch_boringssl=((offset.strip() or None) if mode in ("patch", "auto") else None),
         )
     except requests.RequestException as exc:
