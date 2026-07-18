@@ -8,14 +8,38 @@ Run: uv run python tests/test_security_fixes.py
   inner sh -c (the metacharacter ends up as a literal, not a command separator).
 - config._frida_major: "latest" must classify as a modern major (>= 17), not 0, or the
   CLI prints the opposite Android-16 guidance.
+- shell._stream_download: a supplied sha256 digest must fail closed (mismatch raises and
+  leaves no file / no .part), verify a correct one, and skip on None / an unknown algo
+  so non-GitHub and offline-bypass URLs (which carry no digest) still download.
 """
+import hashlib
 import shlex
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from declaw.hwbp import _SAFE_LIB_PATH  # noqa: E402
 from declaw.config import _frida_major, DEFAULT_FRIDA_VERSION  # noqa: E402
+from declaw import shell  # noqa: E402
+
+
+class _FakeResp:
+    """Minimal streaming-response stand-in for requests.get (context manager)."""
+    def __init__(self, chunks):
+        self._chunks = chunks
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def raise_for_status(self):
+        pass
+
+    def iter_content(self, chunk_size=1):
+        yield from self._chunks
 
 FAILS = 0
 
@@ -66,8 +90,46 @@ def main():
     check(_frida_major("v17.15.2") == 17, "v17.15.2 -> 17")
     check(_frida_major("garbage") == 0, "unparseable -> 0")
 
+    digest_tests()
+
     print("\n%d failure(s)" % FAILS)
     return 1 if FAILS else 0
+
+
+def digest_tests():
+    print("shell._stream_download: sha256 digest verification (mocked transport)")
+    payload = b"declaw integrity test payload " * 4096  # ~120 KB, several chunks
+    good = "sha256:" + hashlib.sha256(payload).hexdigest()
+    orig_get = shell.requests.get
+    shell.requests.get = lambda *a, **k: _FakeResp([payload[i:i + (1 << 16)]
+                                                    for i in range(0, len(payload), 1 << 16)])
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            dst = d / "good.bin"
+            shell._stream_download("http://x/good", dst, expected_digest=good)
+            check(dst.read_bytes() == payload, "correct digest: file lands with exact bytes")
+            check(not (d / "good.bin.part").exists(), "correct digest: .part cleaned up")
+
+            dst2 = d / "bad.bin"
+            raised = ""
+            try:
+                shell._stream_download("http://x/bad", dst2, expected_digest="sha256:" + "0" * 64)
+            except RuntimeError as e:
+                raised = str(e)
+            check("sha256 mismatch" in raised, "wrong digest: raises sha256 mismatch")
+            check(not dst2.exists() and not (d / "bad.bin.part").exists(),
+                  "wrong digest fails closed: no file, no .part left behind")
+
+            dst3 = d / "none.bin"
+            shell._stream_download("http://x/none", dst3, expected_digest=None)
+            check(dst3.read_bytes() == payload, "None digest: downloads unchecked (offline/bypass path)")
+
+            dst4 = d / "algo.bin"
+            shell._stream_download("http://x/algo", dst4, expected_digest="sha512:" + "f" * 128)
+            check(dst4.read_bytes() == payload, "unknown-algo digest: skipped, not falsely rejected")
+    finally:
+        shell.requests.get = orig_get
 
 
 if __name__ == "__main__":

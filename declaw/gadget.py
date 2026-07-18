@@ -44,7 +44,8 @@ def fetch_frida_gadget(abi: str, *, refresh: bool, version: str = DEFAULT_FRIDA_
         log.debug("Using cached %s", so.name)
         return so
     if not xz.exists() or refresh:
-        _stream_download(asset["browser_download_url"], xz)
+        _stream_download(asset["browser_download_url"], xz,
+                         expected_digest=asset.get("digest"))
     log.info("Decompressing %s", xz.name)
     with lzma.open(xz, "rb") as src, open(so, "wb") as dst:
         shutil.copyfileobj(src, dst)

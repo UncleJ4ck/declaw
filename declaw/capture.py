@@ -185,7 +185,8 @@ def fetch_frida_server(abi: str, version: str, *, refresh: bool = False) -> Path
         raise RuntimeError(f"No frida-server asset for {abi} in frida release {tag}")
     xz = UTILS_DIR / asset["name"]
     if not xz.exists() or refresh:
-        _stream_download(asset["browser_download_url"], xz)
+        _stream_download(asset["browser_download_url"], xz,
+                         expected_digest=asset.get("digest"))
     log.info("Decompressing %s", xz.name)
     with lzma.open(xz, "rb") as src, open(out, "wb") as dst:
         shutil.copyfileobj(src, dst)

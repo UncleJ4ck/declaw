@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Optional
+import hashlib
 import os
 import re
 import shutil
@@ -49,8 +50,24 @@ def _gh_latest(api_url: str) -> dict:
     return r.json()
 
 
-def _stream_download(url: str, dest: Path) -> None:
+def _stream_download(url: str, dest: Path, *, expected_digest: Optional[str] = None) -> None:
+    """Stream `url` to `dest` atomically, optionally verifying its SHA-256.
+
+    expected_digest, when given, is GitHub's release-asset digest in the form
+    "sha256:<hex>" (the releases API returns it per asset). The hash is computed
+    over the bytes as they stream and the file is only moved into place when it
+    matches; a mismatch unlinks the partial and raises. This guards a download at
+    fetch time against a corrupted or truncated transfer and CDN drift. It is not
+    a defense against an upstream or transport compromise: whoever can rewrite the
+    downloaded bytes can rewrite the digest the API hands us. Cached files taken
+    by the caller's dest.exists() fast path are not re-checked. An unknown-algo
+    prefix or None skips the check, which keeps non-GitHub / offline-bypass URLs
+    (which carry no digest) working."""
     log.info("Downloading %s", dest.name)
+    h = None
+    if expected_digest and expected_digest.startswith("sha256:"):
+        want = expected_digest.split(":", 1)[1].strip().lower()
+        h = hashlib.sha256()
     tmp = dest.with_suffix(dest.suffix + ".part")
     try:
         with requests.get(url, timeout=300, stream=True) as resp:
@@ -59,10 +76,15 @@ def _stream_download(url: str, dest: Path) -> None:
                 for chunk in resp.iter_content(chunk_size=1 << 20):
                     if chunk:
                         fh.write(chunk)
+                        if h is not None:
+                            h.update(chunk)
+        if h is not None and h.hexdigest() != want:
+            raise RuntimeError(
+                f"{dest.name}: sha256 mismatch (expected {want}, got {h.hexdigest()})")
         tmp.rename(dest)
     except BaseException:
-        # a mid-stream drop must not leave a partial .part orphan behind for the
-        # next run to trip over; the caller retries from scratch.
+        # a mid-stream drop or a failed integrity check must not leave a partial
+        # .part orphan behind for the next run to trip over; the caller retries.
         tmp.unlink(missing_ok=True)
         raise
 
@@ -107,29 +129,19 @@ def _cached_jar(api_url: str, *, refresh: bool) -> Path:
     if dest.exists() and not refresh:
         log.debug("Using cached %s", dest.name)
         return dest
-    _stream_download(asset["browser_download_url"], dest)
+    _stream_download(asset["browser_download_url"], dest,
+                     expected_digest=asset.get("digest"))
     return dest
 
 
 def fetch_bundletool(*, refresh: bool) -> Path:
-    """Return a cached bundletool jar (for .aab -> .apks conversion)."""
-    # Offline fast path: reuse a cached bundletool-*.jar without a GitHub round
-    # trip (matters for air-gapped runs; see DECLAW_BYPASS_URLS docstring).
-    if not refresh:
-        cached = _newest_jar(list(UTILS_DIR.glob("bundletool-*.jar")))
-        if cached:
-            log.debug("Using cached %s", cached.name)
-            return cached
-    info = _gh_latest(BUNDLETOOL_URL)
-    asset = next((a for a in info.get("assets", []) if a["name"].endswith(".jar")), None)
-    if asset is None:
-        raise RuntimeError("No bundletool jar found in latest release")
-    dest = UTILS_DIR / asset["name"]
-    if dest.exists() and not refresh:
-        log.debug("Using cached %s", dest.name)
-        return dest
-    _stream_download(asset["browser_download_url"], dest)
-    return dest
+    """Return a cached bundletool jar (for .aab -> .apks conversion).
+
+    bundletool is just another google/* release jar, so the generic _cached_jar
+    path handles it: same newest-cache glob (see _JAR_CACHE_PATTERNS), same GitHub
+    round-trip, same digest verification. Kept as a named wrapper for the callers
+    that read as "get me bundletool"."""
+    return _cached_jar(BUNDLETOOL_URL, refresh=refresh)
 
 
 def _bundletool_cmd(jar: Path, *args: str) -> list:
