@@ -39,20 +39,6 @@ static long perf_open(struct perf_event_attr *a, pid_t pid, int cpu, int grp, un
     return syscall(SYS_perf_event_open, a, pid, cpu, grp, fl);
 }
 
-// Lowest mapped base of the first segment of the lib whose path contains `sub`.
-static uint64_t find_base(pid_t pid, const char *sub) {
-    char path[64]; snprintf(path, sizeof path, "/proc/%d/maps", pid);
-    FILE *f = fopen(path, "r"); if (!f) return 0;
-    char line[512]; uint64_t base = 0;
-    while (fgets(line, sizeof line, f)) {
-        if (!strstr(line, sub)) continue;
-        uint64_t s;
-        if (sscanf(line, "%lx-", &s) == 1) { base = s; break; }
-    }
-    fclose(f);
-    return base;
-}
-
 static int g_mem = -1;
 // Android tags heap pointers in the top byte (TBI / Scudo memory tagging); the
 // CPU ignores it on access but /proc/pid/mem needs the untagged VA.
@@ -202,9 +188,30 @@ static void add_bp(pid_t pid, const char *sub, uint64_t off) {
     uint64_t addr;
     if (strcmp(sub, "@abs") == 0) addr = off;
     else {
-        uint64_t base = find_base(pid, sub);
-        if (!base) { fprintf(stderr, "hwbp: lib '%s' not mapped in pid %d, skipping\n", sub, pid); return; }
-        addr = base + off;
+        // off is a FILE offset (both the finder and find_verify return file offsets).
+        // Resolve it exactly like hwbp_mempatch: find the r-x mapping of <sub> whose file
+        // range covers off, then addr = start + (off - mapoff). The old base+off only
+        // holds when the exec segment has p_vaddr==p_offset (delta 0, e.g. conscrypt); it
+        // mislands on libflutter (delta 0x10000) and the frida gadget (delta 0x1000),
+        // where the verify breakpoint then never fires and a correct patch gets reverted.
+        char path[64]; snprintf(path, sizeof path, "/proc/%d/maps", pid);
+        FILE *f = fopen(path, "r");
+        if (!f) { fprintf(stderr, "hwbp: cannot open maps for pid %d\n", pid); return; }
+        uint64_t start = 0, mapoff = 0; int found = 0; char line[1024];
+        while (fgets(line, sizeof line, f)) {
+            if (!strstr(line, sub)) continue;
+            uint64_t s, e, o; char perms[8] = {0};
+            if (sscanf(line, "%lx-%lx %7s %lx", &s, &e, perms, &o) != 4) continue;
+            if (perms[2] != 'x') continue;              // executable segment only
+            if (off >= o && off < o + (e - s)) { start = s; mapoff = o; found = 1; break; }
+        }
+        fclose(f);
+        if (!found) {
+            fprintf(stderr, "hwbp: lib '%s' has no exec mapping covering file off 0x%lx "
+                    "in pid %d, skipping\n", sub, (unsigned long)off, pid);
+            return;
+        }
+        addr = start + (off - mapoff);
     }
     g_bps[g_nbps++] = addr;
     printf("bp[%d] %s off=0x%lx -> 0x%lx\n", g_nbps - 1, sub, (unsigned long)off, (unsigned long)addr);
