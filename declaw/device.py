@@ -160,12 +160,20 @@ def pull_package(device: AdbDevice, package: str, dest: Path) -> list[Path]:
         log.info("  pull %s", remote)
         device.sync.pull(remote, local)
         out.append(local)
+    if not out:
+        # The presence guard above only checks that "package:" appears somewhere; if no
+        # line actually starts with it, the loop pulls nothing. Fail closed here instead
+        # of handing an empty list to identify_base_apk (max([]) ValueError downstream).
+        log.error("pm path %s returned no pullable APK lines on %s.", package, device.serial)
+        sys.exit(3)
     log.info("Pulled %d APK(s)", len(out))
     return out
 
 
 def identify_base_apk(apks: list[Path]) -> Path:
     """Pick the APK that actually carries classes.dex."""
+    if not apks:
+        raise ValueError("identify_base_apk: no APKs to choose a base from")
     carriers: list[Path] = []
     for apk in apks:
         try:

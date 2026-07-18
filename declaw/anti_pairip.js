@@ -142,6 +142,13 @@
       });
     });
   });
+  // Clear the fd from HIDE on close(). Without this a later open() that reuses the same
+  // fd number would still be treated as a hidden /proc handle and corrupt its reads.
+  hook('libc.so', 'close', function (p) {
+    Interceptor.attach(p, {
+      onEnter: function (a) { var fd = a[0].toInt32(); if (fd in HIDE) delete HIDE[fd]; }
+    });
+  });
   hook('libc.so', 'read', function (p) {
     Interceptor.attach(p, {
       onEnter: function (a) { this.fd = a[0].toInt32(); this.buf = a[1]; },

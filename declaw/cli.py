@@ -107,7 +107,12 @@ def load_cert_pem(args: argparse.Namespace) -> str:
         if not path.exists():
             log.error("--cert path does not exist: %s", path)
             sys.exit(2)
-        text = path.read_text(encoding="utf-8").strip()
+        try:
+            text = path.read_bytes().decode("utf-8").strip()
+        except (UnicodeDecodeError, IsADirectoryError, OSError):
+            log.error("%s does not look like a PEM certificate "
+                      "(not UTF-8 text; a DER cert or a directory?).", path)
+            sys.exit(2)
         if "BEGIN CERTIFICATE" not in text:
             log.error("%s does not look like a PEM certificate.", path)
             sys.exit(2)

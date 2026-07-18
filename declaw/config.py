@@ -56,6 +56,11 @@ FALLBACK_FRIDA_VERSION = "16.7.19"  # used when frida-compile cannot run (no nod
 
 
 def _frida_major(version: str) -> int:
+    # "latest" is the recommended fix for Android 16+, so it must classify as a modern
+    # major, not 0 (which made cli.py emit the opposite guidance). It resolves to the
+    # current default line downstream, so treat it as that major here.
+    if version.strip().lower() == "latest":
+        return int(DEFAULT_FRIDA_VERSION.split(".")[0])
     try:
         return int(version.lstrip("v").split(".")[0])
     except (ValueError, IndexError):

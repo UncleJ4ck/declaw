@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import re
 import zipfile
 import zlib
 
@@ -145,12 +146,15 @@ def _scan_dex(zf: zipfile.ZipFile, profile: AppProfile) -> None:
             continue
         scanned += 1
         total += len(data)
-        low = data.lower()
+        # okhttp/pin markers are case-sensitive class strings (matched raw). conscrypt and
+        # cronet are matched case-insensitively (obfuscators can alter casing), but via an
+        # in-place IGNORECASE scan rather than the old data.lower(), which copied up to
+        # 64 MB per dex entry.
         if _DEX_OKHTTP in data:
             profile.okhttp = True
-        if _DEX_CONSCRYPT in low:
+        if re.search(_DEX_CONSCRYPT, data, re.IGNORECASE):
             profile.conscrypt = True
-        if _DEX_CRONET in low:
+        if re.search(_DEX_CRONET, data, re.IGNORECASE):
             profile.cronet = True  # cronet sometimes ships as a play-services dep, no libcronet
         # class/method strings keep their real casing in the dex string table, and
         # okhttp3/CertificatePinner is mixed-case, so match against raw bytes not `low`.
