@@ -103,6 +103,44 @@ for got, want, name in [
 ]:
     check(got == want, f"_pick_abi {name}: got {got!r}")
 
+# --- warn when patching with the placeholder cert (no -c): the baked cert is the ONLY
+#     one the injected hooks trust, so without it nothing decrypts ("Trust anchor not found") ---
+import logging, os, tempfile  # noqa: E402
+from declaw.config import log as _declaw_log  # noqa: E402
+
+
+class _Cap(logging.Handler):
+    def __init__(self):
+        super().__init__(); self.msgs = []
+
+    def emit(self, r):
+        self.msgs.append(r.getMessage())
+
+
+def warns(argv, cert_env=None):
+    cap = _Cap(); cap.setLevel(logging.WARNING); _declaw_log.addHandler(cap)
+    saved = os.environ.pop("DECLAW_CERT_PEM", None)
+    if cert_env:
+        os.environ["DECLAW_CERT_PEM"] = cert_env
+    calls.clear()
+    try:
+        C.main(argv)
+    finally:
+        _declaw_log.removeHandler(cap)
+        os.environ.pop("DECLAW_CERT_PEM", None)
+        if saved is not None:
+            os.environ["DECLAW_CERT_PEM"] = saved
+    return any("No proxy CA supplied" in m for m in cap.msgs)
+
+
+_pem = tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False)
+_pem.write("-----BEGIN CERTIFICATE-----\nMIIBAg==\n-----END CERTIFICATE-----\n"); _pem.close()
+check(warns(["pkg", "--mode", "patch"]), "patch without -c warns about placeholder cert")
+check(not warns(["pkg", "--mode", "minimal"]), "minimal (no gadget) does not warn")
+check(not warns(["pkg", "--mode", "patch", "-c", _pem.name]), "patch with -c does not warn")
+check(not warns(["pkg", "--mode", "patch"], cert_env=_pem.name), "DECLAW_CERT_PEM env silences the warning")
+os.unlink(_pem.name)
+
 print()
 if FAILS:
     print(f"{FAILS} FAILURES")

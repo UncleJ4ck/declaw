@@ -224,6 +224,15 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     # --mode minimal folds the old --minimal flag: skip the gadget, NSC only.
     minimal = bool(args.minimal) or mode == "minimal"
+    # The injected hooks trust ONLY the baked CERT_PEM. With the built-in placeholder
+    # (no -c / DECLAW_CERT_PEM) the patched app trusts a dummy cert, so HTTPS never
+    # decrypts and the app throws an opaque "Trust anchor not found". Warn loudly; the
+    # gadget path is the only one that bakes the cert, so skip the warning for minimal.
+    if not minimal and not (args.cert or os.environ.get("DECLAW_CERT_PEM")):
+        log.warning("No proxy CA supplied (-c / DECLAW_CERT_PEM): the injected hooks will "
+                    "trust only a placeholder cert, so traffic will NOT decrypt through your "
+                    "proxy (the app reports 'Trust anchor not found'). Pass -c "
+                    "<your-burp-or-mitmproxy-CA.pem> so the patched app trusts your proxy.")
     # "all"/"none" (or empty) keep every ABI; "auto" resolves per device; else one ABI.
     keep_abi = None if args.keep_abi.strip().lower() in ("all", "none", "") else args.keep_abi.strip()
 
