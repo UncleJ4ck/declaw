@@ -1,0 +1,10 @@
+# compiled arm64 test binaries (rebuild with aarch64-linux-gnu-gcc -O0 -static)
+busy
+hwbp_keylog
+xhwbp
+tls_selftest
+*.build.log
+# generated self-signed test cert/key for tls_selftest (openssl req -x509 ...)
+hk.crt
+hk.key
+rawcap

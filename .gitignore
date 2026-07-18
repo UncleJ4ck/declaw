@@ -1,0 +1,25 @@
+# Python
+env/
+.venv/
+__pycache__/
+*.pyc
+
+# declaw caches / working dirs
+utils/*.jar
+utils/*.so
+utils/*.so.xz
+utils/*.js
+packages/
+patched/
+saved_apks/
+
+# samples pulled during local testing
+samples/
+TESTING.md
+utils/fc/
+utils/
+captures/
+
+# local tool caches
+.serena/
+.claude/
